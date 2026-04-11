@@ -74,7 +74,7 @@ class OpenRouterNode:
                     "8:1 (google/gemini-3.1-flash-image-preview (Nano Banana 2) only)",
                 ], {"default": "auto"}),
                 "image_resolution": (["1K", "2K", "4K"], {"default": "1K"}),
-                "seed": ("INT", {"default": 0, "min": 0, "max": 0x7fffffff, "control_after_generate": "fixed"}),
+                "seed": ("INT", {"default": 0, "min": 0, "max": 0xffffffffffffffff, "control_after_generate": "fixed"}),
                 "temperature": ("FLOAT", {
                     "default": 1.0,
                     "min": 0.0,
