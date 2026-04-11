@@ -15,6 +15,14 @@ from .chat_manager import ChatSessionManager
 # Expecting a dictionary: {"filename": str, "bytes": bytes}
 PDF_DATA_TYPE = "*" # Use '*' to accept any type, check structure later
 
+# Класс-wildcard для входов, принимающих любой тип. ComfyUI сравнивает типы через __ne__,
+# поэтому если всегда возвращать False, любое соединение будет разрешено
+class AnyType(str):
+    def __ne__(self, other):
+        return False
+
+ANY_TYPE = AnyType("*")
+
 class OpenRouterNode:
     """
     A node for interacting with OpenRouter's chat/completion API.
@@ -56,10 +64,10 @@ class OpenRouterNode:
                 "web_search": ("BOOLEAN", {"default": False}),
                 "cheapest": ("BOOLEAN", {"default": True}),
                 "fastest": ("BOOLEAN", {"default": False}),
-                # STRING вместо COMBO - позволяет подключать внешние ноды. Принимает "auto" или значения вида "1:1", "16:9", "21:9", расширенные 1:4, 4:1, 1:8, 8:1 (только Nano Banana 2). Валидация в generate_response
-                "aspect_ratio": ("STRING", {"default": "auto"}),
-                # STRING вместо COMBO - позволяет подключать внешние ноды (External Enum, Power Primitive и т.п.). Валидация значения выполняется в generate_response
-                "image_resolution": ("STRING", {"default": "auto"}),
+                # ANY_TYPE - принимает входы любого типа. Значения: "auto" или "1:1", "16:9", "21:9", расширенные 1:4, 4:1, 1:8, 8:1 (только Nano Banana 2). Валидация в generate_response
+                "aspect_ratio": (ANY_TYPE, {"default": "auto"}),
+                # ANY_TYPE - принимает входы любого типа (STRING, text, enum и т.п. от External Enum / Power Primitive). Валидация в generate_response
+                "image_resolution": (ANY_TYPE, {"default": "auto"}),
                 "seed": ("INT", {"default": 0, "min": 0, "max": 0xffffffffffffffff, "control_after_generate": "fixed"}),
                 "temperature": ("FLOAT", {
                     "default": 1.0,
