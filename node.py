@@ -56,24 +56,10 @@ class OpenRouterNode:
                 "web_search": ("BOOLEAN", {"default": False}),
                 "cheapest": ("BOOLEAN", {"default": True}),
                 "fastest": ("BOOLEAN", {"default": False}),
-                "aspect_ratio": ([
-                    "auto",
-                    "1:1 (1024x1024)",
-                    "2:3 (832x1248)",
-                    "3:2 (1248x832)",
-                    "3:4 (864x1184)",
-                    "4:3 (1184x864)",
-                    "4:5 (896x1152)",
-                    "5:4 (1152x896)",
-                    "9:16 (768x1344)",
-                    "16:9 (1344x768)",
-                    "21:9 (1536x672)",
-                    "1:4 (google/gemini-3.1-flash-image-preview (Nano Banana 2) only)",
-                    "4:1 (google/gemini-3.1-flash-image-preview (Nano Banana 2) only)",
-                    "1:8 (google/gemini-3.1-flash-image-preview (Nano Banana 2) only)",
-                    "8:1 (google/gemini-3.1-flash-image-preview (Nano Banana 2) only)",
-                ], {"default": "auto"}),
-                "image_resolution": (["auto", "1K", "2K", "4K"], {"default": "auto"}),
+                # STRING вместо COMBO - позволяет подключать внешние ноды. Принимает "auto" или значения вида "1:1", "16:9", "21:9", расширенные 1:4, 4:1, 1:8, 8:1 (только Nano Banana 2). Валидация в generate_response
+                "aspect_ratio": ("STRING", {"default": "auto"}),
+                # STRING вместо COMBO - позволяет подключать внешние ноды (External Enum, Power Primitive и т.п.). Валидация значения выполняется в generate_response
+                "image_resolution": ("STRING", {"default": "auto"}),
                 "seed": ("INT", {"default": 0, "min": 0, "max": 0xffffffffffffffff, "control_after_generate": "fixed"}),
                 "temperature": ("FLOAT", {
                     "default": 1.0,
@@ -399,17 +385,35 @@ class OpenRouterNode:
                     auto_ratio, auto_size = self._detect_aspect_and_size(src_w, src_h, modified_model)
                     print(f"[OpenRouter] Auto-detected from image_1 {src_w}x{src_h}: aspect_ratio={auto_ratio}, image_size={auto_size}")
 
+            # Нормализация и валидация aspect_ratio (STRING - может прийти что угодно, включая старый формат "1:1 (1024x1024)")
+            valid_ratios = {"1:1", "2:3", "3:2", "3:4", "4:3", "4:5", "5:4", "9:16", "16:9", "21:9", "1:4", "4:1", "1:8", "8:1"}
+            normalized_ratio = (aspect_ratio or "auto").strip()
+            if normalized_ratio.lower() == "auto":
+                normalized_ratio = "auto"
+            else:
+                # Обрезаем описание в скобках если есть: "1:1 (1024x1024)" -> "1:1"
+                normalized_ratio = normalized_ratio.split(" ", 1)[0]
+                if normalized_ratio not in valid_ratios:
+                    print(f"[OpenRouter] Warning: invalid aspect_ratio '{aspect_ratio}', falling back to auto")
+                    normalized_ratio = "auto"
+
             # image_config собирается динамически: поля добавляются только если значение не "auto" или есть авто-детект
             image_config = {}
-            if aspect_ratio and aspect_ratio != "auto":
-                # В UI формат "1:1 (1024x1024)" - API требует только "1:1", обрезаем описание в скобках
-                clean_ratio = aspect_ratio.split(" ", 1)[0]
-                image_config["aspect_ratio"] = clean_ratio
+            if normalized_ratio != "auto":
+                image_config["aspect_ratio"] = normalized_ratio
             elif auto_ratio:
                 image_config["aspect_ratio"] = auto_ratio
 
-            if image_resolution and image_resolution != "auto":
-                image_config["image_size"] = image_resolution
+            # Нормализация и валидация image_resolution (теперь STRING - может прийти что угодно)
+            normalized_resolution = (image_resolution or "auto").strip().upper()
+            if normalized_resolution == "AUTO":
+                normalized_resolution = "auto"
+            if normalized_resolution not in ("auto", "1K", "2K", "4K"):
+                print(f"[OpenRouter] Warning: invalid image_resolution '{image_resolution}', falling back to auto")
+                normalized_resolution = "auto"
+
+            if normalized_resolution != "auto":
+                image_config["image_size"] = normalized_resolution
             elif auto_size:
                 image_config["image_size"] = auto_size
 
