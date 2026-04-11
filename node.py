@@ -372,7 +372,8 @@ class OpenRouterNode:
 
             # Parse response for text and image content
             message = result["choices"][0]["message"]
-            text_output = message.get("content", "")
+            # Gemini при генерации изображения возвращает content: null - приводим к пустой строке, чтобы downstream-ноды не падали
+            text_output = message.get("content") or ""
             image_tensor = placeholder_image
 
             # Check for images in the separate images field (OpenRouter format)
