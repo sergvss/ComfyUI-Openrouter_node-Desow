@@ -68,7 +68,8 @@ class OpenRouterNode:
                 "aspect_ratio": (ANY_TYPE, {"default": "auto"}),
                 # ANY_TYPE - принимает входы любого типа (STRING, text, enum и т.п. от External Enum / Power Primitive). Валидация в generate_response
                 "image_resolution": (ANY_TYPE, {"default": "auto"}),
-                "seed": ("INT", {"default": 0, "min": 0, "max": 0xffffffffffffffff, "control_after_generate": "fixed"}),
+                # control_after_generate=False отключает автоматический виджет "control after generate", который ComfyUI добавляет к полям с именем "seed". Иначе он может перезаписывать значение перед каждым запуском (randomize/increment)
+                "seed": ("INT", {"default": 0, "min": 0, "max": 0xffffffffffffffff, "control_after_generate": False}),
                 "temperature": ("FLOAT", {
                     "default": 1.0,
                     "min": 0.0,
