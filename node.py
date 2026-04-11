@@ -84,6 +84,12 @@ class OpenRouterNode:
             "optional": {
                 "pdf_data": (PDF_DATA_TYPE,), # Use '*' and check structure in generate_response
                 "user_message_input": ("STRING", {"forceInput": True}),
+                # 5 статических input-слотов для изображений. Подключать можно любые, неиспользуемые остаются None и игнорируются в payload
+                "image_1": ("IMAGE",),
+                "image_2": ("IMAGE",),
+                "image_3": ("IMAGE",),
+                "image_4": ("IMAGE",),
+                "image_5": ("IMAGE",),
             }
         }
 
@@ -218,8 +224,14 @@ class OpenRouterNode:
 
     def generate_response(self, api_key, system_prompt, user_message_box, model,
                          web_search, cheapest, fastest, temperature, pdf_engine, chat_mode,
-                         aspect_ratio="auto", image_resolution="1K", seed=0,
-                         pdf_data=None, user_message_input=None, **kwargs):
+                         aspect_ratio="auto", image_resolution="auto", seed=0,
+                         pdf_data=None, user_message_input=None,
+                         image_1=None, image_2=None, image_3=None, image_4=None, image_5=None,
+                         **kwargs):
+        # Сливаем 5 статических image-слотов в kwargs, чтобы существующий цикл по image_* работал без изменений
+        for _name, _img in (("image_1", image_1), ("image_2", image_2), ("image_3", image_3), ("image_4", image_4), ("image_5", image_5)):
+            if _img is not None:
+                kwargs[_name] = _img
         """
         Sends a completion request to the OpenRouter chat completion endpoint.
         Handles text, optional image, and optional PDF inputs.
@@ -695,8 +707,14 @@ class OpenRouterNode:
     @classmethod
     def IS_CHANGED(cls, api_key, system_prompt, user_message_box, model,
                    web_search, cheapest, fastest, temperature, pdf_engine, chat_mode,
-                   aspect_ratio="auto", image_resolution="1K", seed=0,
-                   pdf_data=None, user_message_input=None, **kwargs):
+                   aspect_ratio="auto", image_resolution="auto", seed=0,
+                   pdf_data=None, user_message_input=None,
+                   image_1=None, image_2=None, image_3=None, image_4=None, image_5=None,
+                   **kwargs):
+        # Сливаем 5 статических image-слотов в kwargs для единого хеширования цикла image_*
+        for _name, _img in (("image_1", image_1), ("image_2", image_2), ("image_3", image_3), ("image_4", image_4), ("image_5", image_5)):
+            if _img is not None:
+                kwargs[_name] = _img
         """
         Check if any input that affects the output has changed.
         Includes hashing image and PDF data.
