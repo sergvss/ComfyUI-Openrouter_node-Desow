@@ -74,7 +74,7 @@ class OpenRouterNode:
                     "8:1 (google/gemini-3.1-flash-image-preview (Nano Banana 2) only)",
                 ], {"default": "auto"}),
                 "image_resolution": (["1K", "2K", "4K"], {"default": "1K"}),
-                "seed": ("INT", {"default": 0, "min": 0, "max": 0xffffffffffffffff, "control_after_generate": "fixed"}),
+                "seed": ("INT", {"default": 0, "min": 0, "max": 0x7fffffff, "control_after_generate": "fixed"}),
                 "temperature": ("FLOAT", {
                     "default": 1.0,
                     "min": 0.0,
@@ -318,12 +318,17 @@ class OpenRouterNode:
                  modified_model = f"{modified_model}:nitro"
 
 
+        # Клэмп seed в диапазон INT32 - Google AI Studio (Gemini) отклоняет значения больше 2^31-1
+        raw_seed = int(seed)
+        clamped_seed = raw_seed % 0x80000000
+        print(f"[OpenRouter] Seed received: {raw_seed} -> sent: {clamped_seed}")
+
         # --- Construct the final payload ---
         data = {
             "model": modified_model,
             "messages": messages,
             "temperature": validated_temp,
-            "seed": seed
+            "seed": clamped_seed
         }
 
         print(f"Payload: model={modified_model}")
