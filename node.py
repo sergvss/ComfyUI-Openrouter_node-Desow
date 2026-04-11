@@ -73,7 +73,7 @@ class OpenRouterNode:
                     "1:8 (google/gemini-3.1-flash-image-preview (Nano Banana 2) only)",
                     "8:1 (google/gemini-3.1-flash-image-preview (Nano Banana 2) only)",
                 ], {"default": "auto"}),
-                "image_resolution": (["1K", "2K", "4K"], {"default": "1K"}),
+                "image_resolution": (["auto", "1K", "2K", "4K"], {"default": "auto"}),
                 "seed": ("INT", {"default": 0, "min": 0, "max": 0xffffffffffffffff, "control_after_generate": "fixed"}),
                 "temperature": ("FLOAT", {
                     "default": 1.0,
@@ -130,6 +130,55 @@ class OpenRouterNode:
             return max(0.0, min(2.0, temp))  # Clamp between 0.0 and 2.0
         except (ValueError, TypeError):
             return 1.0  # Return default if conversion fails
+
+    @staticmethod
+    def _detect_aspect_and_size(src_w, src_h, model_name):
+        """
+        Подбирает ближайшие поддерживаемые aspect_ratio и image_size по размерам исходного изображения.
+        Для Nano Banana 2 (gemini-3.1-flash-image) включает расширенные соотношения 1:4, 4:1, 1:8, 8:1.
+        Возвращает (aspect_ratio_str, image_size_str).
+        """
+        if src_w <= 0 or src_h <= 0:
+            return None, None
+
+        # Базовый набор соотношений, поддерживаемых всеми image-моделями
+        candidates = [
+            ("1:1", 1, 1),
+            ("2:3", 2, 3),
+            ("3:2", 3, 2),
+            ("3:4", 3, 4),
+            ("4:3", 4, 3),
+            ("4:5", 4, 5),
+            ("5:4", 5, 4),
+            ("9:16", 9, 16),
+            ("16:9", 16, 9),
+            ("21:9", 21, 9),
+        ]
+        # Nano Banana 2 (gemini-3.1-flash-image*) поддерживает экстремальные соотношения
+        if "gemini-3.1-flash-image" in model_name.lower():
+            candidates += [
+                ("1:4", 1, 4),
+                ("4:1", 4, 1),
+                ("1:8", 1, 8),
+                ("8:1", 8, 1),
+            ]
+
+        # Находим ближайшее соотношение через минимум модуля разности logarithm (устойчиво к направлению)
+        import math
+        src_ratio = src_w / src_h
+        best_ratio = min(candidates, key=lambda c: abs(math.log(src_ratio) - math.log(c[1] / c[2])))
+        aspect_str = best_ratio[0]
+
+        # image_size по длинной стороне: 1K~1024-1344, 2K~2048, 4K~4096. Границы - геометрические средние
+        longest = max(src_w, src_h)
+        if longest < 1700:          # до sqrt(1024*2048) ~ 1448, округляем вверх
+            size_str = "1K"
+        elif longest < 2900:        # до sqrt(2048*4096) ~ 2896
+            size_str = "2K"
+        else:
+            size_str = "4K"
+
+        return aspect_str, size_str
 
     def fetch_credits(self, api_key):
         """
@@ -331,7 +380,44 @@ class OpenRouterNode:
             "seed": clamped_seed
         }
 
-        print(f"Payload: model={modified_model}")
+        # Определяем, является ли модель image-генерирующей по наличию "image" в имени
+        is_image_model = "image" in modified_model.lower()
+
+        if is_image_model:
+            # Для image-моделей OpenRouter требует явно указать modalities, иначе картинка не возвращается
+            data["modalities"] = ["image", "text"]
+
+            # Если оба параметра auto и есть входное изображение - автоматически определяем ratio и size по image_1
+            auto_ratio = None
+            auto_size = None
+            if aspect_ratio == "auto" or image_resolution == "auto":
+                first_image = kwargs.get("image_1")
+                if first_image is not None and isinstance(first_image, torch.Tensor) and first_image.ndim == 4:
+                    # ComfyUI формат [B, H, W, C]
+                    src_h = int(first_image.shape[1])
+                    src_w = int(first_image.shape[2])
+                    auto_ratio, auto_size = self._detect_aspect_and_size(src_w, src_h, modified_model)
+                    print(f"[OpenRouter] Auto-detected from image_1 {src_w}x{src_h}: aspect_ratio={auto_ratio}, image_size={auto_size}")
+
+            # image_config собирается динамически: поля добавляются только если значение не "auto" или есть авто-детект
+            image_config = {}
+            if aspect_ratio and aspect_ratio != "auto":
+                # В UI формат "1:1 (1024x1024)" - API требует только "1:1", обрезаем описание в скобках
+                clean_ratio = aspect_ratio.split(" ", 1)[0]
+                image_config["aspect_ratio"] = clean_ratio
+            elif auto_ratio:
+                image_config["aspect_ratio"] = auto_ratio
+
+            if image_resolution and image_resolution != "auto":
+                image_config["image_size"] = image_resolution
+            elif auto_size:
+                image_config["image_size"] = auto_size
+
+            # Отправляем image_config только если там есть хотя бы одно поле - иначе провайдер использует свои дефолты
+            if image_config:
+                data["image_config"] = image_config
+
+        print(f"Payload: model={modified_model}, modalities={data.get('modalities')}, image_config={data.get('image_config')}")
 
         # Add plugins if a specific PDF engine is selected
         if pdf_engine != "auto":
