@@ -64,11 +64,6 @@ class OpenRouterNode:
                 "web_search": ("BOOLEAN", {"default": False}),
                 "cheapest": ("BOOLEAN", {"default": True}),
                 "fastest": ("BOOLEAN", {"default": False}),
-                # ANY_TYPE - принимает входы любого типа. Значения: "auto" или "1:1", "16:9", "21:9", расширенные 1:4, 4:1, 1:8, 8:1 (только Nano Banana 2). Валидация в generate_response
-                "aspect_ratio": (ANY_TYPE, {"default": "auto"}),
-                # ANY_TYPE - принимает входы любого типа (STRING, text, enum и т.п. от External Enum / Power Primitive). Валидация в generate_response
-                "image_resolution": (ANY_TYPE, {"default": "auto"}),
-                # control_after_generate=False отключает автоматический виджет "control after generate", который ComfyUI добавляет к полям с именем "seed". Иначе он может перезаписывать значение перед каждым запуском (randomize/increment)
                 "seed": ("INT", {"default": 0, "min": 0, "max": 0xffffffffffffffff, "control_after_generate": False}),
                 "temperature": ("FLOAT", {
                     "default": 1.0,
@@ -82,6 +77,9 @@ class OpenRouterNode:
                 "chat_mode": ("BOOLEAN", {"default": False}),
             },
             "optional": {
+                # ANY_TYPE - принимает входы любого типа (STRING, text, enum, External Enum, Power Primitive). При отсутствии подключения используется "auto". Валидация в generate_response
+                "aspect_ratio": (ANY_TYPE, {"default": "auto"}),
+                "image_resolution": (ANY_TYPE, {"default": "auto"}),
                 "pdf_data": (PDF_DATA_TYPE,), # Use '*' and check structure in generate_response
                 "user_message_input": ("STRING", {"forceInput": True}),
                 # 5 статических input-слотов для изображений. Подключать можно любые, неиспользуемые остаются None и игнорируются в payload
