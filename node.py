@@ -481,8 +481,20 @@ class OpenRouterNode:
             if not result.get("choices") or not result["choices"][0].get("message"):
                  raise ValueError("Invalid response format from API: 'choices' or 'message' missing.")
 
+            # Проверка на ошибку провайдера внутри choices[0] - OpenRouter возвращает HTTP 200 с ошибкой в теле, поэтому raise_for_status() её не ловит
+            choice = result["choices"][0]
+            if choice.get("error"):
+                err = choice["error"]
+                err_code = err.get("code", "?")
+                err_msg = err.get("message", "Unknown provider error")
+                err_meta = err.get("metadata", {})
+                err_type = err_meta.get("error_type", "")
+                full_error = f"Provider error {err_code} ({err_type}): {err_msg}"
+                print(f"ERROR: {full_error}")
+                return (full_error, placeholder_image, f"Stats N/A: {err_type}", self.fetch_credits(api_key))
+
             # Parse response for text and image content
-            message = result["choices"][0]["message"]
+            message = choice["message"]
             # Gemini при генерации изображения возвращает content: null - приводим к пустой строке, чтобы downstream-ноды не падали
             text_output = message.get("content") or ""
             image_tensor = placeholder_image
