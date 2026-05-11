@@ -1,3 +1,5 @@
+import os
+import random
 import requests
 import json
 import time
@@ -9,6 +11,30 @@ import tiktoken
 from PIL import Image
 import hashlib # Added for hashing PDF bytes in IS_CHANGED
 from .chat_manager import ChatSessionManager
+
+
+# API key больше не хранится в widgets_values JSON — это вызывало утечки секрета
+# при экспорте воркфлоу (инцидент 2026-05-10). Теперь читается из переменной
+# окружения OPENROUTER_API_KEY. На ComfyDeploy задаётся через их Secrets-панель,
+# локально — через .env / launcher-скрипт.
+def _get_openrouter_api_key() -> str:
+    return os.environ.get("OPENROUTER_API_KEY", "").strip()
+
+
+# Retry с экспоненциальным backoff для retry-able ошибок API.
+# 429 (rate limit), 5xx (server errors), timeout, connection errors —
+# временные сбои, шансы успеха при повторе высокие. Safety reject и
+# другие 4xx — не retry, Gemini не передумает на тот же промпт.
+def _is_retryable_status(status_code: int) -> bool:
+    return status_code == 429 or status_code >= 500
+
+
+def _retry_sleep(attempt: int, base_delay: float = 1.0) -> None:
+    """Exponential backoff с jitter: 1s, 2s, 4s + random 0-1s.
+    Jitter нужен чтобы N параллельных клиентов не retry'ли одновременно после
+    общего 429 (это снова даст 429)."""
+    wait = base_delay * (2 ** attempt) + random.uniform(0, 1)
+    time.sleep(wait)
 
 # Define a placeholder type name for PDF data.
 # The actual input connection will accept '*' but we check the structure.
@@ -48,10 +74,9 @@ class OpenRouterNode:
         """
         return {
             "required": {
-                "api_key": ("STRING", {
-                    "multiline": False,
-                    "default": ""
-                }),
+                # api_key УБРАН из widgets — теперь читается из переменной окружения
+                # OPENROUTER_API_KEY (см. _get_openrouter_api_key выше). Это убирает
+                # утечку секрета при экспорте воркфлоу в JSON.
                 "system_prompt": ("STRING", {
                     "multiline": True,
                     "default": "You are a helpful assistant."
@@ -75,6 +100,11 @@ class OpenRouterNode:
                 }),
                  "pdf_engine": (["auto", "mistral-ocr", "pdf-text"], {"default": "auto"}),
                 "chat_mode": ("BOOLEAN", {"default": False}),
+                # Количество дополнительных попыток при retry-able ошибках API
+                # (429 rate-limit, 5xx server, timeout, connection error, empty
+                # image response для image-моделей). 0 = без retry (для дебага).
+                # 3 — баланс между UX-устойчивостью и временем ожидания юзера.
+                "max_retries": ("INT", {"default": 3, "min": 0, "max": 5}),
             },
             "optional": {
                 # ANY_TYPE - принимает входы любого типа (STRING, text, enum, External Enum, Power Primitive). При отсутствии подключения используется "auto". Валидация в generate_response
@@ -220,9 +250,10 @@ class OpenRouterNode:
         except json.JSONDecodeError:
              return "Error fetching credits: Could not decode JSON response."
 
-    def generate_response(self, api_key, system_prompt, user_message_box, model,
-                         web_search, cheapest, fastest, temperature, pdf_engine, chat_mode,
-                         aspect_ratio="auto", image_resolution="auto", seed=0,
+    def generate_response(self, system_prompt, user_message_box, model,
+                         web_search, cheapest, fastest, seed, temperature, pdf_engine, chat_mode,
+                         max_retries=3,
+                         aspect_ratio="auto", image_resolution="auto",
                          pdf_data=None, user_message_input=None,
                          image_1=None, image_2=None, image_3=None, image_4=None, image_5=None,
                          **kwargs):
@@ -240,10 +271,21 @@ class OpenRouterNode:
           (3) Stats: a string with tokens per second, prompt tokens, completion tokens
           (4) Credits: a string with the user's credit information
         """
-        # Create empty placeholder image
+        # Create empty placeholder image (используется только для text-only моделей
+        # или для credit/stats полей при ошибках — НЕ как silent-fallback вместо
+        # настоящего сгенерированного изображения).
         placeholder_image = torch.zeros((1, 1, 1, 3), dtype=torch.float32)
+
+        # API key из переменной окружения — больше не из widget'а, чтобы избежать
+        # утечки секрета при экспорте воркфлоу. На ComfyDeploy задаётся через
+        # Secrets-панель; локально — через .env / launcher-скрипт.
+        api_key = _get_openrouter_api_key()
         if not api_key:
-             return ("Error: API Key not provided.", placeholder_image, "Stats N/A", "Credits N/A")
+            raise RuntimeError(
+                "OPENROUTER_API_KEY environment variable is not set. "
+                "Set it via ComfyDeploy Secrets panel (production) or .env / "
+                "launcher script (local ComfyUI)."
+            )
 
         url = "https://openrouter.ai/api/v1/chat/completions"
         headers = {
@@ -302,8 +344,8 @@ class OpenRouterNode:
                         }
                     })
                 except Exception as e:
-                    print(f"Error processing {image_key}: {e}")
-                    return (f"Error processing {image_key}: {e}", placeholder_image, "Stats N/A", "Credits N/A")
+                    # Fail loud: лучше явная ошибка чем silent placeholder.
+                    raise RuntimeError(f"Error processing input {image_key}: {e}") from e
 
         # 3. Add PDF part (optional)
         pdf_filename = "document.pdf" # Default filename if not provided
@@ -326,8 +368,7 @@ class OpenRouterNode:
                         }
                     })
                 except Exception as e:
-                    print(f"Error encoding PDF: {e}")
-                    return (f"Error encoding PDF: {e}", placeholder_image, "Stats N/A", "Credits N/A")
+                    raise RuntimeError(f"Error encoding PDF: {e}") from e
             else:
                 # Handle case where pdf_data is not in the expected format
                 print(f"Warning: pdf_data input is not in the expected format (dict with 'filename' and 'bytes'). PDF not included.")
@@ -463,24 +504,66 @@ class OpenRouterNode:
             print(f"Warning: Token counting failed - {e}")
 
 
-        # --- Make API Call and Process Response ---
-        try:
-            start_time = time.time()
-            response = requests.post(url, headers=headers, json=data)
-            response.raise_for_status() # Raises HTTPError for bad responses (4xx or 5xx)
-            end_time = time.time()
+        # --- Make API Call and Process Response (с retry-loop на retryable errors) ---
+        # Retry стратегия:
+        #   * 429/5xx HTTP, timeout, connection error → retry с exponential backoff
+        #   * Provider error внутри choices[0] (rate_limit, timeout, server_error) → retry
+        #   * Image-модель вернула пустой response без images (soft safety reject /
+        #     временный сбой Gemini) → retry. Раньше тут был silent fallback на
+        #     placeholder, который через ConditionalBranch в графе мог подставлять
+        #     reference-картинку — юзер платил за мусор.
+        #   * Safety reject (явный), 4xx (auth, invalid) → НЕ retry, raise сразу.
+        # После исчерпания попыток любая retry-able ошибка → raise RuntimeError,
+        # ComfyUI/ComfyDeploy корректно помечают run как failed.
+        result = None
+        response = None
+        start_time = None
+        end_time = None
+        last_error = None
+        retryable_provider_error_types = {"rate_limit_exceeded", "timeout", "server_error", "internal_server_error"}
 
-            result = response.json()
-            # Debug: print truncated response to see what OpenRouter returned
+        for attempt in range(max_retries + 1):
+            try:
+                start_time = time.time()
+                response = requests.post(url, headers=headers, json=data, timeout=120)
+                end_time = time.time()
+            except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as exc:
+                last_error = f"Network error: {exc}"
+                if attempt < max_retries:
+                    print(f"[OpenRouter] {last_error} — retry {attempt + 1}/{max_retries} after backoff")
+                    _retry_sleep(attempt)
+                    continue
+                raise RuntimeError(f"OpenRouter API unreachable after {max_retries} retries: {last_error}")
+
+            # Retryable HTTP statuses (429 rate-limit, 5xx server errors)
+            if _is_retryable_status(response.status_code):
+                last_error = f"HTTP {response.status_code}: {response.text[:300]}"
+                if attempt < max_retries:
+                    print(f"[OpenRouter] {last_error} — retry {attempt + 1}/{max_retries} after backoff")
+                    _retry_sleep(attempt)
+                    continue
+                raise RuntimeError(f"OpenRouter API failed after {max_retries} retries: {last_error}")
+
+            # Non-retryable 4xx (401 auth, 400 invalid request, 403 forbidden) — fail fast
+            if response.status_code >= 400:
+                raise RuntimeError(f"OpenRouter API rejected request: HTTP {response.status_code}: {response.text[:300]}")
+
+            # 200 OK — парсим ответ
+            try:
+                result = response.json()
+            except json.JSONDecodeError as exc:
+                raise RuntimeError(f"OpenRouter returned non-JSON response: {exc}")
+
             debug_str = json.dumps(result, default=str)
             print(f"API response ({len(debug_str)} chars): {debug_str[:500]}")
 
-            # --- Extract results and calculate stats ---
             if not result.get("choices") or not result["choices"][0].get("message"):
-                 raise ValueError("Invalid response format from API: 'choices' or 'message' missing.")
+                raise RuntimeError("Invalid response format from API: 'choices' or 'message' missing.")
 
-            # Проверка на ошибку провайдера внутри choices[0] - OpenRouter возвращает HTTP 200 с ошибкой в теле, поэтому raise_for_status() её не ловит
             choice = result["choices"][0]
+
+            # Provider error внутри choices[0] (OpenRouter возвращает HTTP 200 с
+            # ошибкой в теле — raise_for_status её не ловит).
             if choice.get("error"):
                 err = choice["error"]
                 err_code = err.get("code", "?")
@@ -488,11 +571,41 @@ class OpenRouterNode:
                 err_meta = err.get("metadata", {})
                 err_type = err_meta.get("error_type", "")
                 full_error = f"Provider error {err_code} ({err_type}): {err_msg}"
-                print(f"ERROR: {full_error}")
-                return (full_error, placeholder_image, f"Stats N/A: {err_type}", self.fetch_credits(api_key))
 
-            # Parse response for text and image content
+                if err_type.lower() in retryable_provider_error_types and attempt < max_retries:
+                    last_error = full_error
+                    print(f"[OpenRouter] {full_error} — retry {attempt + 1}/{max_retries} after backoff")
+                    _retry_sleep(attempt)
+                    continue
+                # Safety reject, content policy, прочие non-retryable — fail
+                raise RuntimeError(full_error)
+
+            # Для image-моделей пустой response без images = soft fail (safety reject
+            # или временный сбой Gemini). Retry даёт шанс получить картинку при
+            # повторной попытке. Если все попытки пусты — raise (НЕ silent placeholder).
             message = choice["message"]
+            if is_image_model and not message.get("images"):
+                last_error = "image-model returned no images (possibly safety reject or temporary Gemini issue)"
+                if attempt < max_retries:
+                    print(f"[OpenRouter] {last_error} — retry {attempt + 1}/{max_retries} after backoff")
+                    _retry_sleep(attempt)
+                    continue
+                raise RuntimeError(
+                    f"OpenRouter image generation failed after {max_retries} retries: no images in response. "
+                    f"Last response content: {(message.get('content') or '')[:200]}"
+                )
+
+            # Успех — выходим из retry-loop
+            break
+        else:
+            # for-else: достигли max_retries без break — defensive, теоретически
+            # сюда не попадаем (raise срабатывает раньше), но если попали — fail.
+            raise RuntimeError(f"OpenRouter retry-loop exhausted: {last_error}")
+
+        # --- Парсинг успешного ответа ---
+        # На этой точке result, response, start_time, end_time, choice, message гарантированно валидны.
+        try:
+            # Parse response for text and image content
             # Gemini при генерации изображения возвращает content: null - приводим к пустой строке, чтобы downstream-ноды не падали
             text_output = message.get("content") or ""
             image_tensor = placeholder_image
@@ -504,7 +617,7 @@ class OpenRouterNode:
                     # Get the first image from the images array
                     first_image = message["images"][0]
                     image_url = first_image["image_url"]["url"]
-                    
+
                     if image_url.startswith("data:image"):
                         base64_str = image_url.split(",", 1)[1]
                         try:
@@ -518,7 +631,9 @@ class OpenRouterNode:
                 except Exception as e:
                     print(f"Error processing images from response: {e}")
             else:
-                print("No images found in API response - this may be normal if the model doesn't support image generation or the prompt didn't request an image")
+                # Text-only модель — placeholder OK. Для image-моделей мы сюда не
+                # попадём — выше retry-loop поднял бы raise.
+                print("No images found in API response - text-only model, this is normal")
             
             # Also handle legacy multimodal content format as fallback
             if isinstance(text_output, list):
@@ -592,21 +707,16 @@ class OpenRouterNode:
 
             return (text_output, image_tensor, stats_text, credits_text)
 
-        except requests.exceptions.RequestException as e:
-            error_message = f"API Request Error: {str(e)}"
-            if hasattr(e, 'response') and e.response is not None:
-                try:
-                    error_detail = e.response.json()
-                    error_message += f" | Details: {error_detail}"
-                except json.JSONDecodeError:
-                    error_message += f" | Status: {e.response.status_code} | Response: {e.response.text[:200]}"
-            else:
-                 error_message += " (Network or connection issue)"
-            print(f"ERROR: {error_message}")
-            return (error_message, placeholder_image, "Stats N/A due to error", "Credits N/A due to error")
+        except RuntimeError:
+            # RuntimeError из retry-loop пробрасываем как есть — это финальное
+            # состояние после исчерпания попыток или non-retryable ошибки.
+            # ComfyUI/ComfyDeploy увидят exception и корректно пометят run failed.
+            raise
         except Exception as e:
-             print(f"ERROR: Node Error: {str(e)}")
-             return (f"Node Error: {str(e)}", placeholder_image, "Stats N/A due to error", "Credits N/A due to error")
+            # Не-сетевые ошибки парсинга/обработки ответа — тоже raise, НЕ silent
+            # fallback на placeholder. Лучше честный fail чем мусор на выходе.
+            print(f"ERROR: Node Error: {str(e)}")
+            raise RuntimeError(f"OpenRouter node failed: {str(e)}") from e
 
     @staticmethod
     def image_to_base64(image):
