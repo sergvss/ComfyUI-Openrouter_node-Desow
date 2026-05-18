@@ -548,17 +548,41 @@ class OpenRouterNode:
             if response.status_code >= 400:
                 raise RuntimeError(f"OpenRouter API rejected request: HTTP {response.status_code}: {response.text[:300]}")
 
-            # 200 OK — парсим ответ
+            # 200 OK — парсим ответ.
+            # Случай: HTTP 200 + НЕ-JSON body (HTML 502 error page от CF/upstream
+            # routing OpenRouter). Это transient — ретраим, не fail-fast.
             try:
                 result = response.json()
             except json.JSONDecodeError as exc:
-                raise RuntimeError(f"OpenRouter returned non-JSON response: {exc}")
+                last_error = (
+                    f"Non-JSON 200 response (likely upstream gateway error page): "
+                    f"{exc}; body[:300]={response.text[:300]!r}"
+                )
+                if attempt < max_retries:
+                    print(f"[OpenRouter] {last_error} — retry {attempt + 1}/{max_retries} after backoff")
+                    _retry_sleep(attempt)
+                    continue
+                raise RuntimeError(
+                    f"OpenRouter returned non-JSON after {max_retries} retries: {last_error}"
+                )
 
             debug_str = json.dumps(result, default=str)
             print(f"API response ({len(debug_str)} chars): {debug_str[:500]}")
 
+            # Missing choices/message — тоже transient (OpenRouter возвращает HTTP 200
+            # с пустым/невалидным телом при некоторых провайдер-сбоях). Ретраим.
             if not result.get("choices") or not result["choices"][0].get("message"):
-                raise RuntimeError("Invalid response format from API: 'choices' or 'message' missing.")
+                last_error = (
+                    f"Invalid response format: 'choices' or 'message' missing. "
+                    f"Body[:300]={json.dumps(result, default=str)[:300]!r}"
+                )
+                if attempt < max_retries:
+                    print(f"[OpenRouter] {last_error} — retry {attempt + 1}/{max_retries} after backoff")
+                    _retry_sleep(attempt)
+                    continue
+                raise RuntimeError(
+                    f"Invalid response format after {max_retries} retries: 'choices' or 'message' missing."
+                )
 
             choice = result["choices"][0]
 
