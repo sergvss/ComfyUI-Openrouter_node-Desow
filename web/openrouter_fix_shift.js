@@ -37,7 +37,7 @@ app.registerExtension({
         const orig = nodeType.prototype.onNodeCreated;
         nodeType.prototype.onNodeCreated = function () {
             const r = orig ? orig.apply(this, arguments) : undefined;
-            const btn = this.addWidget("button", "🧹 Fix api_key shift", null, () => {
+            const btn = this.addWidget("button", "🧹 Fix api_key shift", "", () => {
                 let fixed = 0;
                 const nodes = (app.graph && app.graph._nodes) || [];
                 for (const n of nodes) {
