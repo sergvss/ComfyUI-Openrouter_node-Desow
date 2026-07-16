@@ -122,12 +122,18 @@ class OpenRouterNode:
                 # текст вставляется в content-массив ПЕРЕД соответствующей картинкой —
                 # это явный role assignment ("THE ROOM PHOTO" / "THE STYLE REFERENCE"),
                 # сигнал сильнее порядковых image_1/image_2 (модель может принять «image_2»
-                # за output target). Пусто = поведение без изменений (обратная совместимость).
-                "image_1_label": ("STRING", {"default": "", "multiline": True}),
-                "image_2_label": ("STRING", {"default": "", "multiline": True}),
-                "image_3_label": ("STRING", {"default": "", "multiline": True}),
-                "image_4_label": ("STRING", {"default": "", "multiline": True}),
-                "image_5_label": ("STRING", {"default": "", "multiline": True}),
+                # за output target). Пусто/не подключено = поведение без изменений.
+                #
+                # forceInput=True — КРИТИЧНО: делает поля input-СОКЕТАМИ, а не виджетами.
+                # Виджеты в ComfyUI хранятся позиционно (widgets_values), и добавление
+                # виджетов сдвинуло бы значения во ВСЕХ существующих нодах на базе этой.
+                # Сокеты в widgets_values не попадают → обратная совместимость 100%.
+                # Значение подаётся подключением text-ноды к сокету.
+                "image_1_label": ("STRING", {"forceInput": True}),
+                "image_2_label": ("STRING", {"forceInput": True}),
+                "image_3_label": ("STRING", {"forceInput": True}),
+                "image_4_label": ("STRING", {"forceInput": True}),
+                "image_5_label": ("STRING", {"forceInput": True}),
             }
         }
 
