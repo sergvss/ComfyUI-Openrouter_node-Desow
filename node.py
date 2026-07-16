@@ -4,6 +4,7 @@ import requests
 import json
 import time
 import base64
+import re
 import io
 import numpy as np
 import torch
@@ -118,22 +119,6 @@ class OpenRouterNode:
                 "image_3": ("IMAGE",),
                 "image_4": ("IMAGE",),
                 "image_5": ("IMAGE",),
-                # Опциональные inline-подписи ("роли") для каждой картинки. Если задано,
-                # текст вставляется в content-массив ПЕРЕД соответствующей картинкой —
-                # это явный role assignment ("THE ROOM PHOTO" / "THE STYLE REFERENCE"),
-                # сигнал сильнее порядковых image_1/image_2 (модель может принять «image_2»
-                # за output target). Пусто/не подключено = поведение без изменений.
-                #
-                # forceInput=True — КРИТИЧНО: делает поля input-СОКЕТАМИ, а не виджетами.
-                # Виджеты в ComfyUI хранятся позиционно (widgets_values), и добавление
-                # виджетов сдвинуло бы значения во ВСЕХ существующих нодах на базе этой.
-                # Сокеты в widgets_values не попадают → обратная совместимость 100%.
-                # Значение подаётся подключением text-ноды к сокету.
-                "image_1_label": ("STRING", {"forceInput": True}),
-                "image_2_label": ("STRING", {"forceInput": True}),
-                "image_3_label": ("STRING", {"forceInput": True}),
-                "image_4_label": ("STRING", {"forceInput": True}),
-                "image_5_label": ("STRING", {"forceInput": True}),
             }
         }
 
@@ -266,6 +251,35 @@ class OpenRouterNode:
         except json.JSONDecodeError:
              return "Error fetching credits: Could not decode JSON response."
 
+    @staticmethod
+    def _parse_inline_image_labels(text):
+        """Разбирает маркеры [[IMGn]] в тексте промпта для inline role-labeling картинок.
+
+        Возвращает (prompt_text, {"image_n": label, ...}):
+        - текст до первого маркера -> основной промпт;
+        - текст после [[IMGn]] и до следующего маркера -> подпись для image_n
+          (вставляется ПЕРЕД соответствующей картинкой в content-массиве);
+        - нет маркеров -> (исходный текст, {}) — поведение без изменений.
+        Маркер регистронезависим, пробелы допускаются: [[IMG1]], [[ img 2 ]].
+        НЕ добавляет входов ноды -> widgets_values/сокеты не сдвигаются.
+        """
+        if not text:
+            return text, {}
+        marker_re = re.compile(r'\[\[\s*IMG\s*(\d+)\s*\]\]', re.IGNORECASE)
+        matches = list(marker_re.finditer(text))
+        if not matches:
+            return text, {}
+        prompt_text = text[:matches[0].start()].strip()
+        labels = {}
+        for i, m in enumerate(matches):
+            n = m.group(1)
+            start = m.end()
+            end = matches[i + 1].start() if i + 1 < len(matches) else len(text)
+            label = text[start:end].strip()
+            if label:
+                labels[f"image_{n}"] = label
+        return prompt_text, labels
+
     def generate_response(self, system_prompt, user_message_box, model,
                          web_search, cheapest, fastest, seed, temperature, pdf_engine, chat_mode,
                          max_retries=3,
@@ -338,28 +352,31 @@ class OpenRouterNode:
         # --- Build the user message content ---
         user_content_blocks = []
 
-        # 1. Add Text part (always present)
+        # 1. Add Text part (always present).
+        # Inline-подписи картинок: в user_text можно вставить маркеры [[IMG1]] / [[IMG2]] ...
+        # Текст до первого маркера — основной промпт; текст после [[IMGn]] — подпись-роль,
+        # вставляемая ПЕРЕД картинкой image_n (role assignment для мультимодалки).
+        # Нет маркеров -> всё как раньше. НЕ добавляет входов -> ничего не сдвигается.
+        prompt_text, inline_image_labels = self._parse_inline_image_labels(user_text)
         user_content_blocks.append({
             "type": "text",
-            "text": user_text
+            "text": prompt_text
         })
 
         # 2. Add Image parts (optional) - support multiple images from kwargs
         # Process all image_N inputs from kwargs
-        # Исключаем ключи *_label — это подписи, а не картинки
-        image_keys = sorted([k for k in kwargs.keys() if k.startswith('image_') and not k.endswith('_label')],
+        image_keys = sorted([k for k in kwargs.keys() if k.startswith('image_')],
                            key=lambda x: int(x.split('_')[1]))
 
         for image_key in image_keys:
             if kwargs[image_key] is not None:
                 try:
-                    # Опциональная inline-подпись ПЕРЕД картинкой (role assignment).
-                    # Напр. image_1_label="THE ROOM PHOTO — preserve structure". Пусто -> без изменений.
-                    label = kwargs.get(f"{image_key}_label")
-                    if isinstance(label, str) and label.strip():
+                    # Inline-подпись перед картинкой (из маркеров [[IMGn]] в промпте)
+                    label = inline_image_labels.get(image_key)
+                    if label:
                         user_content_blocks.append({
                             "type": "text",
-                            "text": label.strip()
+                            "text": label
                         })
                     img_str = self.image_to_base64(kwargs[image_key])
                     user_content_blocks.append({
