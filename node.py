@@ -907,7 +907,7 @@ class OpenRouterNode:
 
 
     @classmethod
-    def IS_CHANGED(cls, api_key, system_prompt, user_message_box, model,
+    def IS_CHANGED(cls, system_prompt, user_message_box, model,
                    web_search, cheapest, fastest, temperature, pdf_engine, chat_mode,
                    aspect_ratio="auto", image_resolution="auto", seed=0,
                    pdf_data=None, user_message_input=None,
@@ -968,7 +968,7 @@ class OpenRouterNode:
 
         # Combine all relevant inputs into a tuple for comparison
         # Use primitive types where possible for reliable hashing/comparison
-        return (api_key, system_prompt, user_message_box, model,
+        return (system_prompt, user_message_box, model,
                 web_search, cheapest, fastest, temp_float, pdf_engine, chat_mode,
                 aspect_ratio, image_resolution, seed, tuple(image_hashes), pdf_hash, user_message_input)
 
