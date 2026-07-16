@@ -301,6 +301,22 @@ class OpenRouterNode:
           (3) Stats: a string with tokens per second, prompt tokens, completion tokens
           (4) Credits: a string with the user's credit information
         """
+        # --- Compat-шим: устаревший api_key-виджет в старых воркфлоу ---
+        # Нода перешла на ключ из ENV (коммит d80c8a2), но воркфлоу, сохранённые
+        # раньше, всё ещё держат api_key в widgets_values[0]. Лишнее значение
+        # сдвигает ВСЕ виджеты на 1 позицию (ComfyUI мапит widgets_values позиционно):
+        # system_prompt получает ключ, user_message_box — реальный system_prompt, и т.д.
+        # Детектим сдвиг по сигнатуре ключа в system_prompt и восстанавливаем реальные
+        # значения. Воркфлоу БЕЗ устаревшей строки не затрагиваются (обычный system_prompt
+        # не начинается с sk-or-) → оба типа воркфлоу работают без ручной правки.
+        # Ключ здесь игнорируется — реальный берётся из ENV (см. _get_openrouter_api_key).
+        _sp_probe = system_prompt.strip() if isinstance(system_prompt, str) else ""
+        if _sp_probe.startswith("sk-or-") or "OPENROUTER_API_KEY" in _sp_probe.upper():
+            (system_prompt, user_message_box, model, web_search, cheapest,
+             fastest, seed, temperature, pdf_engine, chat_mode, max_retries) = (
+                user_message_box, model, web_search, cheapest, fastest,
+                seed, temperature, pdf_engine, chat_mode, max_retries, 3)
+
         # Create empty placeholder image (используется только для text-only моделей
         # или для credit/stats полей при ошибках — НЕ как silent-fallback вместо
         # настоящего сгенерированного изображения).
