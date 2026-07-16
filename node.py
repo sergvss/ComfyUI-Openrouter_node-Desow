@@ -118,6 +118,16 @@ class OpenRouterNode:
                 "image_3": ("IMAGE",),
                 "image_4": ("IMAGE",),
                 "image_5": ("IMAGE",),
+                # Опциональные inline-подписи ("роли") для каждой картинки. Если задано,
+                # текст вставляется в content-массив ПЕРЕД соответствующей картинкой —
+                # это явный role assignment ("THE ROOM PHOTO" / "THE STYLE REFERENCE"),
+                # сигнал сильнее порядковых image_1/image_2 (модель может принять «image_2»
+                # за output target). Пусто = поведение без изменений (обратная совместимость).
+                "image_1_label": ("STRING", {"default": "", "multiline": True}),
+                "image_2_label": ("STRING", {"default": "", "multiline": True}),
+                "image_3_label": ("STRING", {"default": "", "multiline": True}),
+                "image_4_label": ("STRING", {"default": "", "multiline": True}),
+                "image_5_label": ("STRING", {"default": "", "multiline": True}),
             }
         }
 
@@ -330,12 +340,21 @@ class OpenRouterNode:
 
         # 2. Add Image parts (optional) - support multiple images from kwargs
         # Process all image_N inputs from kwargs
-        image_keys = sorted([k for k in kwargs.keys() if k.startswith('image_')], 
+        # Исключаем ключи *_label — это подписи, а не картинки
+        image_keys = sorted([k for k in kwargs.keys() if k.startswith('image_') and not k.endswith('_label')],
                            key=lambda x: int(x.split('_')[1]))
-        
+
         for image_key in image_keys:
             if kwargs[image_key] is not None:
                 try:
+                    # Опциональная inline-подпись ПЕРЕД картинкой (role assignment).
+                    # Напр. image_1_label="THE ROOM PHOTO — preserve structure". Пусто -> без изменений.
+                    label = kwargs.get(f"{image_key}_label")
+                    if isinstance(label, str) and label.strip():
+                        user_content_blocks.append({
+                            "type": "text",
+                            "text": label.strip()
+                        })
                     img_str = self.image_to_base64(kwargs[image_key])
                     user_content_blocks.append({
                         "type": "image_url",
