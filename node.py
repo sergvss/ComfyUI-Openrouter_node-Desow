@@ -50,14 +50,36 @@ class AnyType(str):
 
 ANY_TYPE = AnyType("*")
 
+
+def _to_echo_text(value):
+    """Приводит значение к строке для диагностических эхо-выходов
+    (STRING-выход ComfyUI не должен получить None/не-строку)."""
+    return value if isinstance(value, str) else ("" if value is None else str(value))
+
+
 class OpenRouterNode:
     """
     A node for interacting with OpenRouter's chat/completion API.
     Supports text, images, and PDFs as input.
-    Returns three outputs:
-      1) "Output": the text response from the LLM
-      2) "Stats": a string detailing tokens per second, input tokens, and output tokens
-      3) "Credits": a string showing your remaining OpenRouter account balance
+
+    Returns six outputs. Slots 0-3 are the historical contract — their order and
+    types MUST NOT change, saved workflows reference outputs positionally:
+      0) "Output": the text response from the LLM (STRING)
+      1) "image": image tensor if the response contains an image, else a 1x1 placeholder (IMAGE)
+      2) "Stats": tokens per second, prompt/completion tokens, temperature, model (STRING)
+      3) "Credits": remaining OpenRouter account balance (STRING)
+
+    Slots 4-5 are DIAGNOSTIC ONLY (added for debugging, not part of the generation
+    pipeline). They echo what was ACTUALLY sent to the model on this run, i.e. after
+    the legacy api_key compat-shim re-assigned the widgets and after the [[IMGn]]
+    inline-label parser split the user text:
+      4) "SystemPromptUsed": the exact content of the {"role": "system"} message,
+         or "" if no system message was sent (possible in chat_mode sessions) (STRING)
+      5) "UserPromptUsed": the user message as sent. For text-only requests it is the
+         raw string sent as content. For multimodal requests it is a readable join of
+         the actual content blocks in order: main prompt, per-image labels and
+         "[IMAGE image_N]" / "[PDF <filename>]" placeholders (base64 payloads are NOT
+         echoed) (STRING)
     """
 
     models_cache = None
@@ -122,8 +144,11 @@ class OpenRouterNode:
             }
         }
 
-    RETURN_TYPES = ("STRING", "IMAGE", "STRING", "STRING",)
-    RETURN_NAMES = ("Output", "image", "Stats", "Credits")
+    # ВНИМАНИЕ: слоты 0-3 (Output/image/Stats/Credits) — зафиксированный контракт,
+    # на них ссылаются связи во всех сохранённых воркфлоу. Новые выходы добавлять
+    # ТОЛЬКО в конец. Слоты 4-5 — диагностические (реальные промпты запроса).
+    RETURN_TYPES = ("STRING", "IMAGE", "STRING", "STRING", "STRING", "STRING",)
+    RETURN_NAMES = ("Output", "image", "Stats", "Credits", "SystemPromptUsed", "UserPromptUsed")
 
     FUNCTION = "generate_response"
     CATEGORY = "LLM"
@@ -295,11 +320,18 @@ class OpenRouterNode:
         Sends a completion request to the OpenRouter chat completion endpoint.
         Handles text, optional image, and optional PDF inputs.
 
-        Returns four outputs:
+        Returns six outputs:
           (1) Output: the LLM's text response
           (2) image: an image tensor if the response contains an image, else empty tensor
           (3) Stats: a string with tokens per second, prompt tokens, completion tokens
           (4) Credits: a string with the user's credit information
+          (5) SystemPromptUsed: DIAGNOSTIC — the system message actually sent
+          (6) UserPromptUsed: DIAGNOSTIC — the user message actually sent (без base64)
+
+        Error paths keep raising RuntimeError (fail loud) — они НЕ возвращают кортеж
+        вообще, поэтому диагностические выходы там просто не создаются. Превращать
+        raise в return с пустыми строками нельзя: silent-fallback на ошибке API уже
+        приводил к утечке reference-картинки в результат.
         """
         # --- Compat-шим: устаревший api_key-виджет в старых воркфлоу ---
         # Нода перешла на ключ из ENV (коммит d80c8a2), но воркфлоу, сохранённые
@@ -378,6 +410,10 @@ class OpenRouterNode:
             "type": "text",
             "text": prompt_text
         })
+        # Эхо пользовательского промпта для диагностического выхода: собирается
+        # параллельно с content-блоками, чтобы сохранить РЕАЛЬНЫЙ порядок
+        # текст/подпись/вложение. Вместо base64 кладём короткий плейсхолдер.
+        user_echo_parts = [prompt_text]
 
         # 2. Add Image parts (optional) - support multiple images from kwargs
         # Process all image_N inputs from kwargs
@@ -394,6 +430,7 @@ class OpenRouterNode:
                             "type": "text",
                             "text": label
                         })
+                        user_echo_parts.append(label)
                     img_str = self.image_to_base64(kwargs[image_key])
                     user_content_blocks.append({
                         "type": "image_url",
@@ -401,6 +438,7 @@ class OpenRouterNode:
                             "url": f"data:image/png;base64,{img_str}"
                         }
                     })
+                    user_echo_parts.append(f"[IMAGE {image_key}]")
                 except Exception as e:
                     # Fail loud: лучше явная ошибка чем silent placeholder.
                     raise RuntimeError(f"Error processing input {image_key}: {e}") from e
@@ -425,6 +463,7 @@ class OpenRouterNode:
                             "file_data": data_url
                         }
                     })
+                    user_echo_parts.append(f"[PDF {pdf_filename}]")
                 except Exception as e:
                     raise RuntimeError(f"Error encoding PDF: {e}") from e
             else:
@@ -458,6 +497,22 @@ class OpenRouterNode:
         else:
             # In non-chat mode, messages array already has system prompt, just append user message
             messages.append(new_user_message)
+
+        # --- Диагностические выходы: ФАКТИЧЕСКИ отправляемые промпты ---
+        # Берём из уже собранного messages, а не из аргументов ноды: к этому моменту
+        # отработал compat-шим сдвига виджетов, а в chat_mode системное сообщение
+        # может прийти из сохранённой сессии (или отсутствовать вовсе -> "").
+        _system_msg = next((m for m in messages if m.get("role") == "system"), None)
+        system_prompt_used = _to_echo_text(_system_msg.get("content")) if _system_msg else ""
+        # Text-only запрос уходит простой строкой (маркеры [[IMGn]] в ней НЕ вырезаны,
+        # т.к. картинок нет) — отдаём её как есть. Мультимодальный собран из блоков —
+        # отдаём читаемую склейку блоков в реальном порядке, без base64.
+        if isinstance(new_user_message["content"], str):
+            user_prompt_used = _to_echo_text(new_user_message["content"])
+        else:
+            user_prompt_used = "\n".join(
+                part for part in (_to_echo_text(p) for p in user_echo_parts) if part
+            )
 
         # --- Apply model modifiers ---
         modified_model = model
@@ -787,7 +842,8 @@ class OpenRouterNode:
                 # Save the updated conversation
                 self.chat_manager.save_conversation(session_path, messages)
 
-            return (text_output, image_tensor, stats_text, credits_text)
+            return (text_output, image_tensor, stats_text, credits_text,
+                    system_prompt_used, user_prompt_used)
 
         except RuntimeError:
             # RuntimeError из retry-loop пробрасываем как есть — это финальное
