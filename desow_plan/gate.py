@@ -1,7 +1,8 @@
 # ВЕНДОРЕННЫЙ КОД. Источник: desow/plan2d/gate.py - синхронизировать при правках.
 # Отличие от источника: только импорт схемы (schema -> schema_lite). Двойное
 # ведение осознанное: на машине ComfyUI бэкенда Desow нет (README, «Ноды Desow»).
-"""Гейт проёмов: комната обязана иметь дверь и окно (требование приёмки Фазы 1).
+"""Гейт проёмов: комната обязана иметь дверь и окно (требование приёмки Фазы 1),
+и ни один проём не должен налезать на другой или на угол.
 
 Сканер видит только то, что попало в кадр; front-стена находится за камерой,
 поэтому на части боевых кадров (например scan_379) итоговый набор проёмов
@@ -12,65 +13,86 @@
   петли у того же угла, открывание внутрь);
 - нет ни одного окна -> окно по центру front-стены.
 
+Обе вставки идут через общий `geometry.place_opening`, то есть считаются с уже
+стоящими проёмами. Перед ними работает `resolve_opening_conflicts`: он разводит
+то, что пришло от VLM и мержа (наложения, проём впритык к углу, проём шире
+стены). Порядок именно такой — гейт должен видеть уже вычищенную стену, иначе
+свободные интервалы считаются по мусорной картине.
+
 Гейт работает ПОСЛЕ мержа и ДО расстановки мебели: валидатор расстановки должен
 видеть дугу вставленной двери и полосу перед вставленным окном.
 """
 from __future__ import annotations
 
-from .geometry import free_spans, wall_span
-from .schema_lite import DEFAULT_WIDTH_DW, DOOR_TYPES, DW_M, WINDOW_TYPES
+from .geometry import clamp, occupied_spans, place_opening, usable_spans, wall_span
+from .schema_lite import (
+    DEFAULT_WIDTH_DW,
+    DOOR_TYPES,
+    MIN_CORNER_CLEARANCE_DW,
+    MIN_OPENING_WIDTH_DW,
+    WINDOW_TYPES,
+)
 
 GATE_WALL = "front"
-DOOR_CORNER_CLEARANCE_M = 0.2
-DOOR_CORNER_CLEARANCE_DW = DOOR_CORNER_CLEARANCE_M / DW_M
 MIN_WINDOW_WIDTH_DW = 0.8   # окно уже 0.68 м рисовать бессмысленно
 
 
-def _occupied_spans(plan: dict, wall: str) -> list[tuple[float, float]]:
-    """Занятые проёмами отрезки указанной стены в глобальных offset-координатах."""
-    spans: list[tuple[float, float]] = []
-    for op in plan.get("openings", []):
-        if op.get("wall") != wall:
-            continue
-        off, w = float(op.get("offset_dw", 0)), float(op.get("width_dw", 0))
-        spans.append((off - w / 2, off + w / 2))
-    return spans
+def resolve_opening_conflicts(plan: dict) -> list[str]:
+    """Разводит проёмы, налезающие друг на друга, на угол или на край стены.
 
+    Источник таких проёмов — не только деградация мержа: модель тоже присылает
+    проём впритык к углу (боевой кадр e4 серии v83: passage вплотную к углу
+    «открыл» его на чертеже). Рендер клэмпит проём внутрь стены, но простенка не
+    гарантирует, и картинка расходилась бы с сохранённым planjson.
 
-def _place_near_corner(spans: list[tuple[float, float]], width: float, wall_start: float, wall_end: float):
-    """Центр проёма шириной width у ближайшего к углу свободного места.
+    По каждой стене слева направо: проём клэмпится в стену с простенком
+    MIN_CORNER_CLEARANCE от угла, при наложении на предыдущий сдвигается вправо,
+    при нехватке места сужается, а если сужать некуда — выбрасывается (план без
+    проёма честнее плана с проёмом внахлёст). Проёмы, которые ни с чем не
+    конфликтуют, не двигаются и не меняют ширину.
 
-    Возврат: `(offset, hinge)` или None, если ни один свободный интервал не вмещает
-    проём. hinge — «left»/«right» по тому углу, к которому проём прижат.
+    Возвращает пометки вида `moved:door/front`, `narrowed:window/back 1.60->1.20`,
+    `dropped:passage/left` — они уходят в meta плана и в debug ноды.
     """
-    fitting = [(a, b) for a, b in spans if b - a >= width - 1e-6]
-    if not fitting:
-        return None
-    # Ближайший к любому из углов интервал; из двух вариантов берём тот, чей
-    # свободный край ближе к своему углу.
-    best = min(fitting, key=lambda s: min(s[0] - wall_start, wall_end - s[1]))
-    a, b = best
-    if (a - wall_start) <= (wall_end - b):
-        offset = a + min(DOOR_CORNER_CLEARANCE_DW, max(0.0, (b - a) - width)) + width / 2
-        return offset, "left"
-    offset = b - min(DOOR_CORNER_CLEARANCE_DW, max(0.0, (b - a) - width)) - width / 2
-    return offset, "right"
+    notes: list[str] = []
+    openings = plan.get("openings") or []
+    room = plan.get("room") or {}
+    by_wall: dict = {}
+    for op in openings:
+        by_wall.setdefault(op.get("wall"), []).append(op)
 
+    dropped: set[int] = set()
+    for wall, items in by_wall.items():
+        if not isinstance(wall, str):
+            continue   # ребро полигона по индексу: длину стены здесь не резолвим
+        start, end = wall_span(room, wall)
+        cursor = start + MIN_CORNER_CLEARANCE_DW
+        for op in sorted(items, key=lambda o: float(o.get("offset_dw", 0))):
+            width = float(op.get("width_dw", 0))
+            available = end - MIN_CORNER_CLEARANCE_DW - cursor
+            if available < min(width, MIN_OPENING_WIDTH_DW):
+                dropped.add(id(op))
+                notes.append("dropped:%s/%s" % (op.get("type"), wall))
+                continue
+            if width > available:
+                notes.append("narrowed:%s/%s %.2f->%.2f" % (op.get("type"), wall, width, available))
+                width = available
+            offset = float(op.get("offset_dw", 0))
+            low, high = cursor + width / 2, end - MIN_CORNER_CLEARANCE_DW - width / 2
+            # Допуск в 1e-3 dw (0.85 мм) — меньше пикселя чертежа. Без него каждый
+            # проём, поставленный ровно по норме и округлённый до 3 знаков, ловил
+            # бы «сдвиг» на своём же округлении и засорял пометки.
+            if offset < low - 1e-3 or offset > high + 1e-3:
+                moved = clamp(offset, low, high)
+                notes.append("moved:%s/%s %.2f->%.2f" % (op.get("type"), wall, offset, moved))
+                offset = moved
+            op["offset_dw"] = round(offset, 3)
+            op["width_dw"] = round(width, 3)
+            cursor = offset + width / 2 + MIN_CORNER_CLEARANCE_DW
 
-def _place_centered(spans: list[tuple[float, float]], width: float, wall_start: float, wall_end: float):
-    """Центр проёма по центру стены; при коллизии — центр самого широкого свободного
-    интервала, при необходимости с сужением проёма. Возврат: `(offset, width)` или None."""
-    center = (wall_start + wall_end) / 2
-    for a, b in spans:
-        if a <= center - width / 2 + 1e-6 and center + width / 2 <= b + 1e-6:
-            return center, width
-    widest = max(spans, key=lambda s: s[1] - s[0], default=None)
-    if widest is None:
-        return None
-    span_len = widest[1] - widest[0]
-    if span_len < MIN_WINDOW_WIDTH_DW:
-        return None
-    return (widest[0] + widest[1]) / 2, min(width, span_len)
+    if dropped:
+        plan["openings"] = [op for op in openings if id(op) not in dropped]
+    return notes
 
 
 def ensure_door_and_window(plan: dict) -> list[str]:
@@ -88,17 +110,17 @@ def ensure_door_and_window(plan: dict) -> list[str]:
 
     if not (present & DOOR_TYPES):
         width = DEFAULT_WIDTH_DW["door"]
-        spans = free_spans(wall_start, wall_end, _occupied_spans(plan, GATE_WALL))
-        placement = _place_near_corner(spans, width, wall_start, wall_end)
+        spans = usable_spans(wall_start, wall_end, occupied_spans(openings, GATE_WALL))
+        placement = place_opening(spans, width, wall_start, wall_end, anchor="corner")
         if placement is None:
             notes.append("door_gate_skipped")
         else:
-            offset, hinge = placement
+            offset, eff_width, hinge = placement
             openings.append({
                 "type": "door",
                 "wall": GATE_WALL,
                 "offset_dw": round(offset, 3),
-                "width_dw": width,
+                "width_dw": round(eff_width, 3),
                 "swing": {"hinge": hinge, "direction": "in"},
             })
             notes.append("door_inserted")
@@ -106,12 +128,14 @@ def ensure_door_and_window(plan: dict) -> list[str]:
     present = {op.get("type") for op in openings}
     if not (present & WINDOW_TYPES):
         width = DEFAULT_WIDTH_DW["window"]
-        spans = free_spans(wall_start, wall_end, _occupied_spans(plan, GATE_WALL))
-        placement = _place_centered(spans, width, wall_start, wall_end)
+        spans = usable_spans(wall_start, wall_end, occupied_spans(openings, GATE_WALL))
+        placement = place_opening(
+            spans, width, wall_start, wall_end, anchor="center", min_width=MIN_WINDOW_WIDTH_DW
+        )
         if placement is None:
             notes.append("window_gate_skipped")
         else:
-            offset, eff_width = placement
+            offset, eff_width, _side = placement
             openings.append({
                 "type": "window",
                 "wall": GATE_WALL,

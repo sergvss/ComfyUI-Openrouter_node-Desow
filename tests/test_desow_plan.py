@@ -10,14 +10,17 @@ import pytest
 from PIL import Image
 
 from desow_plan import blank_png, build_empty_plan
-from desow_plan.gate import ensure_door_and_window
+from desow_plan.gate import ensure_door_and_window, resolve_opening_conflicts
 from desow_plan.merge import merge_with_scanner, scanner_openings_from_scan
 from desow_plan.render import render_plan
 from desow_plan.scanner import parse_scanner_openings
-from desow_plan.schema_lite import PlanDataError, validate_plan
+from desow_plan.schema_lite import MIN_CORNER_CLEARANCE_DW, PlanDataError, validate_plan
 
 
 ROOM = {"shape": "rectangle", "width_dw": 4.0, "depth_dw": 5.0}
+
+
+WALL_LEN_KEY = {"back": "width_dw", "front": "width_dw", "left": "depth_dw", "right": "depth_dw"}
 
 
 def plan_with(**kwargs):
@@ -25,6 +28,30 @@ def plan_with(**kwargs):
     base = {"room": dict(ROOM), "openings": []}
     base.update(kwargs)
     return base
+
+
+def assert_no_overlaps(plan, *, clearance=0.0):
+    """Проёмы внутри своих стен и не налезают друг на друга.
+
+    `clearance` — требуемый простенок от углов и между соседями (0 = проверяем
+    только сам факт наложения). Допуск 1.5e-3 dw — план хранится с округлением
+    координат до трёх знаков, это чуть больше половины его единицы.
+    """
+    tol = 1.5e-3
+    room = plan["room"]
+    by_wall = {}
+    for op in plan["openings"]:
+        by_wall.setdefault(op["wall"], []).append(
+            (op["type"], op["offset_dw"] - op["width_dw"] / 2, op["offset_dw"] + op["width_dw"] / 2)
+        )
+    for wall, items in by_wall.items():
+        length = float(room[WALL_LEN_KEY[wall]])
+        items.sort(key=lambda i: i[1])
+        for kind, a, b in items:
+            assert a >= clearance - tol, "%s/%s начинается в %.3f (стена 0..%.2f)" % (kind, wall, a, length)
+            assert b <= length - clearance + tol, "%s/%s кончается в %.3f (стена 0..%.2f)" % (kind, wall, b, length)
+        for (k1, _, b1), (k2, a2, _) in zip(items, items[1:]):
+            assert a2 >= b1 + clearance - tol, "%s и %s на %s внахлёст" % (k1, k2, wall)
 
 
 # ── schema_lite: комната ─────────────────────────────────────────────
@@ -243,6 +270,73 @@ def test_merge_falls_back_to_scanner_composition_with_defaults():
     assert door["swing"] == {"hinge": "left", "direction": "in"}
 
 
+def test_merge_defaults_do_not_stack_on_each_other():
+    # Боевой кадр e4 серии v83: три проёма сканера на одной стене, у VLM позиции
+    # только для одного — два дефолта садились в центр стены поверх всего.
+    vlm = plan_with(openings=[{"type": "window", "wall": "right", "offset_dw": 2.8, "width_dw": 1.2}])
+    scanner = {"openings": [
+        {"type": "door", "wall": "right"}, {"type": "door", "wall": "right"},
+        {"type": "window", "wall": "right"},
+    ]}
+    merged, meta = merge_with_scanner(scanner, [vlm])
+    assert meta["fallback_scanner_composition"] is True
+    assert_no_overlaps(merged)
+
+
+def test_merge_moves_default_to_another_wall_when_no_room():
+    # Боевой кадр f1: панорама занимает почти всю стену, дефолтной двери места нет.
+    vlm = plan_with(openings=[
+        {"type": "floor_to_ceiling_window", "wall": "left", "offset_dw": 2.5, "width_dw": 4.6},
+    ])
+    scanner = {"openings": [
+        {"type": "floor_to_ceiling_window", "wall": "left"}, {"type": "door", "wall": "left"},
+    ]}
+    merged, meta = merge_with_scanner(scanner, [vlm])
+    door = next(o for o in merged["openings"] if o["type"] == "door")
+    assert door["wall"] == "right"                       # та же ориентация
+    assert meta["moved_to_wall"] == [(("door", "left"), "right")]
+    assert_no_overlaps(merged)
+
+
+def test_merge_pairs_same_type_on_disputed_wall():
+    # Боевой кадр e5: дверь одна, но сканер видит её на left, а VLM на back —
+    # раньше «добавка VLM» превращала её во вторую дверь.
+    vlm = plan_with(openings=[{"type": "door", "wall": "back", "offset_dw": 1.3, "width_dw": 1.0}])
+    merged, meta = merge_with_scanner({"openings": [{"type": "door", "wall": "left"}]}, [vlm])
+    assert [o["wall"] for o in merged["openings"]] == ["left"]
+    assert meta["added_from_vlm"] == []
+    assert meta["paired_wall_dispute"] == [("door", "back", "left")]
+
+
+def test_merge_does_not_pair_passage_or_across_types():
+    # passage сканер не эмитит вообще, а окно и дверь — разные проёмы: обе записи
+    # VLM обязаны остаться добавками, иначе спаривание съест реальные проёмы.
+    vlm = plan_with(openings=[
+        {"type": "passage", "wall": "back", "offset_dw": 2.0, "width_dw": 1.0},
+        {"type": "window", "wall": "back", "offset_dw": 3.4, "width_dw": 1.0},
+    ])
+    merged, meta = merge_with_scanner({"openings": [{"type": "door", "wall": "left"}]}, [vlm])
+    assert meta["paired_wall_dispute"] == []
+    assert sorted(meta["added_from_vlm"]) == [("passage", "back"), ("window", "back")]
+    assert len(merged["openings"]) == 3
+
+
+def test_merge_keeps_balcony_door_inside_glazing_on_same_wall():
+    # Регресс scan_424: остекление в пол и балконная дверь на ОДНОЙ стене —
+    # состав покрыт обычным covers, спаривание не должно вмешиваться.
+    vlm = plan_with(openings=[
+        {"type": "floor_to_ceiling_window", "wall": "back", "offset_dw": 1.45, "width_dw": 1.3},
+        {"type": "door", "wall": "back", "offset_dw": 2.55, "width_dw": 0.9},
+    ])
+    scanner = {"openings": [
+        {"type": "floor_to_ceiling_window", "wall": "back"}, {"type": "door", "wall": "back"},
+    ]}
+    merged, meta = merge_with_scanner(scanner, [vlm])
+    assert meta["fallback_scanner_composition"] is False
+    assert meta["paired_wall_dispute"] == []
+    assert len(merged["openings"]) == 2
+
+
 # ── gate ─────────────────────────────────────────────────────────────
 
 def test_gate_inserts_door_at_front_corner():
@@ -284,11 +378,72 @@ def test_gate_is_noop_when_door_and_window_present():
     assert len(plan["openings"]) == 2
 
 
+def test_gate_insert_keeps_clearance_from_existing_opening():
+    # Окно уже стоит на front-стене; вставленная дверь обязана оставить простенок.
+    plan = plan_with(openings=[{"type": "window", "wall": "front", "offset_dw": 1.2, "width_dw": 1.6}])
+    assert ensure_door_and_window(plan) == ["door_inserted"]
+    assert_no_overlaps(plan, clearance=MIN_CORNER_CLEARANCE_DW)
+
+
 def test_gate_skips_when_front_wall_is_full():
     plan = plan_with(openings=[
         {"type": "floor_to_ceiling_window", "wall": "front", "offset_dw": 2.0, "width_dw": 4.0},
     ])
     assert ensure_door_and_window(plan) == ["door_gate_skipped"]
+
+
+# ── развод конфликтов ────────────────────────────────────────────────
+
+def test_resolve_moves_opening_away_from_corner():
+    # Боевой кадр e4: passage вплотную к углу «открывал» его на чертеже.
+    plan = plan_with(openings=[{"type": "passage", "wall": "back", "offset_dw": 3.5, "width_dw": 1.0}])
+    notes = resolve_opening_conflicts(plan)
+    assert notes and notes[0].startswith("moved:passage/back")
+    assert_no_overlaps(plan, clearance=MIN_CORNER_CLEARANCE_DW)
+
+
+def test_resolve_separates_overlapping_openings():
+    plan = plan_with(openings=[
+        {"type": "window", "wall": "back", "offset_dw": 2.0, "width_dw": 1.5},
+        {"type": "door", "wall": "back", "offset_dw": 2.2, "width_dw": 1.0},
+    ])
+    resolve_opening_conflicts(plan)
+    assert_no_overlaps(plan, clearance=MIN_CORNER_CLEARANCE_DW)
+
+
+def test_resolve_narrows_opening_wider_than_wall():
+    plan = plan_with(openings=[{"type": "window", "wall": "back", "offset_dw": 2.0, "width_dw": 5.0}])
+    notes = resolve_opening_conflicts(plan)
+    assert any(n.startswith("narrowed:window/back") for n in notes)
+    assert_no_overlaps(plan, clearance=MIN_CORNER_CLEARANCE_DW)
+
+
+def test_resolve_drops_opening_when_wall_is_full():
+    plan = plan_with(openings=[
+        {"type": "floor_to_ceiling_window", "wall": "back", "offset_dw": 2.0, "width_dw": 3.5},
+        {"type": "door", "wall": "back", "offset_dw": 3.8, "width_dw": 1.0},
+    ])
+    notes = resolve_opening_conflicts(plan)
+    assert "dropped:door/back" in notes
+    assert [o["type"] for o in plan["openings"]] == ["floor_to_ceiling_window"]
+
+
+def test_resolve_leaves_clean_plan_untouched():
+    plan = plan_with(openings=[
+        {"type": "window", "wall": "back", "offset_dw": 2.0, "width_dw": 1.5},
+        {"type": "door", "wall": "left", "offset_dw": 1.0, "width_dw": 1.0},
+    ])
+    before = json.dumps(plan, sort_keys=True)
+    assert resolve_opening_conflicts(plan) == []
+    assert json.dumps(plan, sort_keys=True) == before
+
+
+def test_resolve_ignores_openings_anchored_to_polygon_edge():
+    # wall задан индексом ребра (l_shape): длину такой стены здесь не резолвим,
+    # трогать проём вслепую нельзя.
+    plan = plan_with(openings=[{"type": "door", "wall": 2, "offset_dw": 99.0, "width_dw": 1.0}])
+    assert resolve_opening_conflicts(plan) == []
+    assert plan["openings"][0]["offset_dw"] == 99.0
 
 
 # ── render ───────────────────────────────────────────────────────────
@@ -377,6 +532,93 @@ def test_pipeline_reports_dropped_openings():
     _, plan_json, debug = build_empty_plan(extraction, "", "")
     assert plan_json                                       # план построен без битого проёма
     assert "extract_fix:" in debug and "выброшен" in debug
+
+
+# ── боевые кадры серии v83 (preview, 2026-08-06) ─────────────────────
+# Ответы экстрактора в артефактах прогонов не сохранены (наружу выводятся только
+# openings, plan_json и debug), поэтому входы восстановлены из plan_json + debug
+# каждого прогона. Все четыре кадра до фикса давали дефектный план.
+
+def run_case(extraction, scanner):
+    _, plan_json, debug = build_empty_plan(json.dumps(extraction), json.dumps(scanner), "")
+    assert plan_json, debug
+    return json.loads(plan_json), debug
+
+
+def test_v83_e4_three_scanner_openings_on_one_wall():
+    """e4: две двери и окно на правой стене + passage впритык к углу."""
+    plan, debug = run_case(
+        {"room": {"shape": "rectangle", "width_dw": 4.8, "depth_dw": 4.5},
+         "openings": [
+             {"type": "door", "wall": "back", "offset_dw": 2.9, "width_dw": 1.0,
+              "swing": {"hinge": "left", "direction": "out"}, "confidence": 0.9},
+             {"type": "passage", "wall": "back", "offset_dw": 4.3, "width_dw": 1.0, "confidence": 0.85},
+             {"type": "window", "wall": "right", "offset_dw": 2.8, "width_dw": 1.2, "confidence": 0.7},
+         ]},
+        {"openings": [
+            {"type": "door", "wall": "right", "position_on_wall": "left", "confidence": 0.9},
+            {"type": "door", "wall": "right", "position_on_wall": "right", "confidence": 0.85},
+            {"type": "window", "wall": "right", "position_on_wall": "single", "confidence": 0.55},
+        ]},
+    )
+    assert_no_overlaps(plan, clearance=MIN_CORNER_CLEARANCE_DW)
+    assert "merge_move:" in debug           # окну не хватило места на правой стене
+    assert "moved:passage/back" in debug    # угол закрыт
+
+
+def test_v83_e5_single_door_read_on_two_walls():
+    """e5: одна дверь, разные стены у сканера и VLM — раньше выходило две."""
+    plan, debug = run_case(
+        {"room": {"shape": "rectangle", "width_dw": 4.5, "depth_dw": 6.8},
+         "openings": [{"type": "door", "wall": "back", "offset_dw": 1.3, "width_dw": 1.0,
+                       "confidence": 0.85}]},
+        {"openings": [{"type": "door", "wall": "left", "position_on_wall": "center",
+                       "confidence": 0.9}]},
+    )
+    doors = [o for o in plan["openings"] if o["type"] == "door"]
+    assert len(doors) == 1 and doors[0]["wall"] == "left"       # стена — от сканера
+    assert len(plan["openings"]) == 2                           # + окно от гейта
+    assert "merge_pair: door back→left" in debug
+    assert_no_overlaps(plan, clearance=MIN_CORNER_CLEARANCE_DW)
+
+
+def test_v83_f1_default_door_inside_panoramic_window():
+    """f1: дефолтная дверь садилась внутрь панорамного остекления."""
+    plan, _ = run_case(
+        {"room": {"shape": "rectangle", "width_dw": 6.8, "depth_dw": 5.0},
+         "openings": [
+             {"type": "floor_to_ceiling_window", "wall": "left", "offset_dw": 2.5,
+              "width_dw": 3.2, "confidence": 0.92},
+             {"type": "floor_to_ceiling_window", "wall": "back", "offset_dw": 2.1,
+              "width_dw": 3.0, "confidence": 0.88},
+         ]},
+        {"openings": [
+            {"type": "floor_to_ceiling_window", "wall": "left", "confidence": 0.92},
+            {"type": "door", "wall": "left", "confidence": 0.72},
+        ]},
+    )
+    assert_no_overlaps(plan, clearance=MIN_CORNER_CLEARANCE_DW)
+    assert len([o for o in plan["openings"] if o["type"] == "door"]) == 1
+
+
+@pytest.mark.parametrize("tag, extraction, scanner", [
+    ("e3_bedroom",
+     {"room": {"shape": "rectangle", "width_dw": 4.2, "depth_dw": 4.8},
+      "openings": [{"type": "window", "wall": "back", "offset_dw": 2.0, "width_dw": 2.4,
+                    "confidence": 0.95}]},
+     {"openings": [{"type": "window", "wall": "back", "confidence": 0.97}]}),
+    ("f4_living",
+     {"room": {"shape": "rectangle", "width_dw": 4.8, "depth_dw": 5.8},
+      "openings": [{"type": "window", "wall": "right", "offset_dw": 3.5, "width_dw": 2.4,
+                    "confidence": 0.92}]},
+     {"openings": [{"type": "window", "wall": "right", "confidence": 0.92}]}),
+])
+def test_v83_clean_frames_do_not_regress(tag, extraction, scanner):
+    """Кадры со штатным мержем: фикс не должен ничего в них двигать."""
+    plan, debug = run_case(extraction, scanner)
+    assert "conflicts: нет" in debug
+    assert len(plan["openings"]) == 2                  # окно VLM + дверь гейта
+    assert_no_overlaps(plan, clearance=MIN_CORNER_CLEARANCE_DW)
 
 
 # ── обёртка ComfyUI (нужен torch) ────────────────────────────────────

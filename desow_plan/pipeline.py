@@ -4,7 +4,7 @@
 выброшено всё сетевое: экстракцией занимается OpenRouter-нода графа, сюда её
 ответ приходит уже строкой.
 
-    разбор экстракции -> мерж со сканером -> гейт двери/окна -> рендер
+    разбор экстракции -> мерж со сканером -> развод конфликтов -> гейт -> рендер
 
 Инвариант ноды: **ошибка данных не роняет воркфлоу.** Любая фатальная проблема
 даёт белый лист, пустой `plan_json` и человекочитаемый `debug` с причиной — скан
@@ -18,7 +18,7 @@ import json
 
 from PIL import Image
 
-from .gate import ensure_door_and_window
+from .gate import ensure_door_and_window, resolve_opening_conflicts
 from .merge import merge_with_scanner, scanner_openings_from_scan
 from .render import CANVAS, PAGE, render_plan
 from .scanner import extract_json_object, parse_scanner_openings
@@ -85,14 +85,27 @@ def build_empty_plan(extraction_json, scanner_openings_json="", room_type=""):
         % ("сканера (расхождение)" if merge_meta["fallback_scanner_composition"] else "VLM покрыл сканер",
            merge_meta["added_from_vlm"] or "[]", merge_meta["defaults_used"] or "[]")
     )
+    for kind, vlm_wall, scan_wall in merge_meta["paired_wall_dispute"]:
+        # Один проём, прочитанный с разными стенами, а не два разных.
+        debug.append("merge_pair: %s %s→%s (спор о стене, взята стена сканера)" % (kind, vlm_wall, scan_wall))
+    for key, wall in merge_meta["moved_to_wall"]:
+        debug.append("merge_move: %s -> стена %s (на своей нет места)" % (key, wall))
+    for key in merge_meta["dropped_no_space"]:
+        debug.append("merge_drop: %s выброшен (места нет ни на одной стене)" % (key,))
 
-    # 3) Гейт: комната без двери/окна дальше не идёт (решение принимается здесь,
+    # 3) Развод конфликтов: наложения и проёмы впритык к углу приходят и от VLM,
+    # и из дефолтных позиций мержа. До гейта, чтобы он считал свободные интервалы
+    # стены по уже вычищенной картине.
+    conflict_notes = resolve_opening_conflicts(plan)
+    debug.append("conflicts: %s" % (", ".join(conflict_notes) if conflict_notes else "нет"))
+
+    # 4) Гейт: комната без двери/окна дальше не идёт (решение принимается здесь,
     # кодом, и въезжает в сохранённый план — инструкции генератору не нужны).
     gate_notes = ensure_door_and_window(plan)
     debug.append("gate: %s" % (", ".join(gate_notes) if gate_notes else "дверь и окно уже есть"))
     debug.append("openings_final: %d %s" % (len(plan["openings"]), _fmt_ops(plan["openings"])))
 
-    # 4) Рендер. Геометрические ошибки тоже не роняют воркфлоу.
+    # 5) Рендер. Геометрические ошибки тоже не роняют воркфлоу.
     try:
         png, render_meta = render_plan(plan, with_furniture=False)
     except (ValueError, KeyError, ZeroDivisionError, OverflowError) as exc:

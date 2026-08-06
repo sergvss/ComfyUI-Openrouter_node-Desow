@@ -7,7 +7,11 @@
 - состав проёмов по (тип, стена) — приоритет СКАНЕРА; типы нормализуются
   (door|double_door -> door, window|floor_to_ceiling_window -> window);
 - позиция / ширина / петля — от VLM (сканер не измеряет геометрию);
-- проём VLM, которого нет у сканера, ОСТАЁТСЯ (сканер — пол, не потолок);
+- проём VLM, которого нет у сканера, ОСТАЁТСЯ (сканер — пол, не потолок), КРОМЕ
+  случая, когда он спаривается с непокрытой записью сканера того же типа на
+  другой стене: это один проём, прочитанный дважды, а не два;
+- дефолтная позиция считается по свободным интервалам стены (простенок от углов
+  и соседей), а не «в центр» — иначе несколько дефолтов садятся друг на друга;
 - расхождение по составу (у VLM нет проёма сканера) -> вызывающий делает второй
   прогон VLM и передаёт оба; после двух расхождений — состав сканера, позиции от
   ближайшего прогона (или дефолт: центр стены, ширина door=1.0 / window=1.6 dw).
@@ -19,7 +23,18 @@ from __future__ import annotations
 
 import copy
 
-from .schema_lite import DEFAULT_WIDTH_DW, WALL_LEN_KEYS
+from .geometry import occupied_spans, place_opening, usable_spans, wall_span
+from .schema_lite import DEFAULT_WIDTH_DW
+
+# Стена той же ориентации — первый кандидат при переносе проёма, которому не
+# хватило места на назначенной сканером стене.
+OPPOSITE_WALL = {"back": "front", "front": "back", "left": "right", "right": "left"}
+ALL_WALLS = ("back", "front", "left", "right")
+
+# Типы, для которых спор о стене между сканером и VLM означает ОДИН проём,
+# прочитанный дважды. `passage` сюда не входит: детектор сканера открытые проходы
+# вообще не эмитит, поэтому passage от VLM — всегда законная добавка.
+PAIRABLE_TYPES = frozenset({"door", "window"})
 
 
 def norm_type(t: str) -> str:
@@ -65,11 +80,43 @@ def scanner_openings_from_scan(scan_openings: list[dict]) -> list[dict]:
     return out
 
 
+def _place_default(room: dict, placed: list[dict], wall: str, width: float, kind: str):
+    """Позиция дефолтного проёма с учётом УЖЕ размещённых. `(wall, offset, width, side)`.
+
+    Сканер знает состав проёмов, но не их геометрию; когда VLM не дал позицию,
+    её приходится назначать. Раньше это был безусловный центр стены — и на
+    деградации мержа два-три дефолта садились в одну точку, а то и поверх проёма
+    с реальной геометрией (боевые кадры e4/f1 серии v83).
+
+    Порядок поиска стены: назначенная сканером -> противоположная (та же
+    ориентация, чаще всего это его ошибка привязки) -> любая свободная.
+    Нигде не поместилось -> None: проём отбрасывается, потому что план без
+    проёма честнее плана с проёмом внахлёст.
+    """
+    # Якорь «по центру свободного места» — прежнее поведение дефолта (центр стены),
+    # ограниченное свободными интервалами. Прижимать дверь к углу здесь незачем:
+    # это норма ГЕЙТА для двери, которой никто не видел, а тут дверь видел сканер.
+    order = [wall, OPPOSITE_WALL.get(wall)] + list(ALL_WALLS)
+    tried: list[str] = []
+    for candidate in order:
+        if candidate is None or candidate in tried:
+            continue
+        tried.append(candidate)
+        start, end = wall_span(room, candidate)
+        spans = usable_spans(start, end, occupied_spans(placed, candidate))
+        placement = place_opening(spans, width, start, end, anchor="center")
+        if placement is not None:
+            offset, eff_width, side = placement
+            return candidate, offset, eff_width, side
+    return None
+
+
 def merge_with_scanner(scanner: dict, vlm_runs: list[dict]) -> tuple[dict, dict]:
     """scanner: `{"openings":[{type, wall, ...}]}`; vlm_runs: полные JSON экстракций.
 
     Возврат: `(merged_json, meta)`. meta: `{source_run, consensus_needed,
-    fallback_scanner_composition, added_from_vlm, defaults_used}`.
+    fallback_scanner_composition, added_from_vlm, defaults_used, moved_to_wall,
+    dropped_no_space, paired_wall_dispute}`.
     """
     scanner_ops = scanner.get("openings", [])
     meta = {
@@ -78,6 +125,9 @@ def merge_with_scanner(scanner: dict, vlm_runs: list[dict]) -> tuple[dict, dict]
         "fallback_scanner_composition": False,
         "added_from_vlm": [],
         "defaults_used": [],
+        "moved_to_wall": [],
+        "dropped_no_space": [],
+        "paired_wall_dispute": [],
     }
 
     # 1) Ищем прогон VLM, покрывающий состав сканера.
@@ -120,21 +170,48 @@ def merge_with_scanner(scanner: dict, vlm_runs: list[dict]) -> tuple[dict, dict]
             merged_ops.append(op)
         else:
             room = base.get("room", {})
-            wl = float(room.get(WALL_LEN_KEYS.get(so["wall"], "width_dw"), 4.0))
             nt = norm_type(so["type"])
+            # Спор о стене: тот же тип проёма, но VLM и сканер назвали разные стены.
+            # Это ОДИН проём, прочитанный дважды, а не два (боевой кадр e5 серии
+            # v83: door/left сканера + door/back VLM дали две двери в комнате с
+            # одной). Спариваем 1:1, стена — от сканера (состав всегда его),
+            # позиция VLM неприменима (она про другую стену) -> дефолт ниже.
+            # `passage` не спариваем: сканер их не эмитит вообще, а значит любой
+            # passage VLM — законная добавка, а не спорное чтение.
+            twin = None
+            if nt in PAIRABLE_TYPES:
+                twin = next(
+                    (c for c in candidates
+                     if id(c) not in used and norm_type(c.get("type", "")) == nt),
+                    None,
+                )
+            if twin is not None:
+                used.append(id(twin))
+                meta["paired_wall_dispute"].append((nt, twin.get("wall"), so["wall"]))
+            placement = _place_default(
+                room, merged_ops, so["wall"], DEFAULT_WIDTH_DW.get(nt, 1.0), nt
+            )
+            if placement is None:
+                meta["dropped_no_space"].append(k)
+                continue
+            wall, offset, width, side = placement
             op = {
                 "type": so["type"],
-                "wall": so["wall"],
-                "offset_dw": wl / 2,
-                "width_dw": DEFAULT_WIDTH_DW.get(nt, 1.0),
+                "wall": wall,
+                "offset_dw": round(offset, 3),
+                "width_dw": round(width, 3),
             }
             if nt == "door":
-                op["swing"] = {
-                    "hinge": "back" if so["wall"] in ("left", "right") else "left",
-                    "direction": "in",
-                }
+                # Петля у того угла, к которому проём прижат: на вертикальных
+                # стенах ближний к back-углу конец называется "back".
+                if wall in ("left", "right"):
+                    op["swing"] = {"hinge": "back" if side == "left" else "front", "direction": "in"}
+                else:
+                    op["swing"] = {"hinge": side, "direction": "in"}
             merged_ops.append(op)
             meta["defaults_used"].append(k)
+            if wall != so["wall"]:
+                meta["moved_to_wall"].append((k, wall))
     # Добавки VLM сверх сканера (из первого прогона) остаются.
     pool = [_key(o) for o in scanner_ops]
     for op in vlm_runs[0].get("openings", []):

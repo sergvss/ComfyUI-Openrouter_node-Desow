@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import math
 
-from .schema_lite import WALL_T_DW
+from .schema_lite import MIN_CORNER_CLEARANCE_DW, MIN_OPENING_WIDTH_DW, WALL_T_DW
 
 # Единичные векторы направлений «внутрь комнаты» для стен-якорей простенков.
 PART_VEC = {"front": (0.0, 1.0), "back": (0.0, -1.0), "left": (-1.0, 0.0), "right": (1.0, 0.0)}
@@ -209,3 +209,84 @@ def free_spans(
     if cursor < wall_end:
         spans.append((cursor, wall_end))
     return spans
+
+
+def clamp(value: float, low: float, high: float) -> float:
+    """Значение в границах; при вывернутых границах — их середина."""
+    if low > high:
+        return (low + high) / 2
+    return max(low, min(high, value))
+
+
+def occupied_spans(openings: list, wall) -> list[tuple[float, float]]:
+    """Занятые проёмами отрезки указанной стены в её offset-координатах."""
+    spans: list[tuple[float, float]] = []
+    for op in openings:
+        if op.get("wall") != wall:
+            continue
+        off, w = float(op.get("offset_dw", 0)), float(op.get("width_dw", 0))
+        spans.append((off - w / 2, off + w / 2))
+    return spans
+
+
+def usable_spans(
+    wall_start: float,
+    wall_end: float,
+    occupied: list[tuple[float, float]],
+    clearance: float = MIN_CORNER_CLEARANCE_DW,
+) -> list[tuple[float, float]]:
+    """Отрезки стены, куда можно поставить НОВЫЙ проём.
+
+    От каждого свободного интервала отступаем `clearance` с обеих сторон: слева и
+    справа находится либо угол комнаты, либо соседний проём, и в обоих случаях
+    нужен простенок. Вырожденные интервалы отбрасываются.
+    """
+    out: list[tuple[float, float]] = []
+    for a, b in free_spans(wall_start, wall_end, occupied):
+        a, b = a + clearance, b - clearance
+        if b - a > 1e-9:
+            out.append((a, b))
+    return out
+
+
+def place_opening(
+    spans: list[tuple[float, float]],
+    width: float,
+    wall_start: float,
+    wall_end: float,
+    *,
+    anchor: str = "center",
+    min_width: float = MIN_OPENING_WIDTH_DW,
+):
+    """Куда поставить проём шириной `width` среди свободных отрезков `spans`.
+
+    Единая точка размещения для мержа (дефолтные позиции) и гейта (вставка двери
+    и окна): раньше каждый ставил проём «по формуле» и не видел соседей, отчего
+    на деградации мержа проёмы садились друг на друга.
+
+    `anchor="center"` — ближе к центру стены (окна, проходы); `"corner"` — прижать
+    к ближайшему углу (двери; простенок 0.2 м уже заложен в `usable_spans`).
+    Целиком не влезает — проём сужается по самому широкому отрезку, но не меньше
+    `min_width`.
+
+    Возврат: `(offset, width, side)` или None, если места нет. `side` — к какому
+    концу стены проём прижат ("left"/"right"), из него берётся петля двери.
+    """
+    if not spans:
+        return None
+    fitting = [s for s in spans if s[1] - s[0] >= width - 1e-9]
+    if not fitting:
+        widest = max(spans, key=lambda s: s[1] - s[0])
+        if widest[1] - widest[0] < min_width:
+            return None
+        fitting, width = [widest], widest[1] - widest[0]
+    if anchor == "corner":
+        a, b = min(fitting, key=lambda s: min(s[0] - wall_start, wall_end - s[1]))
+        if (a - wall_start) <= (wall_end - b):
+            return a + width / 2, width, "left"
+        return b - width / 2, width, "right"
+    center = (wall_start + wall_end) / 2
+    a, b = min(fitting, key=lambda s: abs(clamp(center, s[0] + width / 2, s[1] - width / 2) - center))
+    offset = clamp(center, a + width / 2, b - width / 2)
+    side = "left" if offset - wall_start <= wall_end - offset else "right"
+    return offset, width, side
