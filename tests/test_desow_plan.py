@@ -519,6 +519,20 @@ def test_pipeline_never_raises_on_bad_extraction(text):
         assert image.convert("L").getextrema() == (255, 255)   # белый лист-заглушка
 
 
+def test_pipeline_handles_openrouter_soft_failure_string():
+    """Вход `OPENROUTER_ERROR: ...` от OpenRouterNode с fail_soft=True.
+
+    Так экстрактор отдаёт свою ошибку, не роняя прогон: нода плана обязана увести
+    её в белый лист и debug, а не сделать вид, что план построен.
+    """
+    soft = "OPENROUTER_ERROR: RuntimeError: OpenRouter API unreachable after 3 retries"
+    png, plan_json, debug = build_empty_plan(soft, "", "")
+    assert plan_json == ""
+    assert "ОШИБКА" in debug and "OPENROUTER_ERROR" in debug   # причина видна в отчёте
+    with Image.open(io.BytesIO(png)) as image:
+        assert image.convert("L").getextrema() == (255, 255)
+
+
 def test_pipeline_survives_broken_scanner_json():
     _, plan_json, debug = build_empty_plan(EXTRACTION, "}{ сломано", "")
     assert plan_json and "scanner_fix:" in debug

@@ -22,6 +22,18 @@ def _get_openrouter_api_key() -> str:
     return os.environ.get("OPENROUTER_API_KEY", "").strip()
 
 
+def _looks_like_stale_api_key(value) -> bool:
+    """Признак легаси-сдвига виджетов: в первом виджете застрял устаревший api_key.
+
+    Воркфлоу, сохранённые до перехода на ключ из ENV, держат api_key в
+    `widgets_values[0]`; лишнее значение сдвигает ВСЕ виджеты на позицию.
+    Детект по сигнатуре ключа, а не по числу значений: количество виджетов ноды
+    со временем меняется, а `sk-or-` в системном промпте не появляется никогда.
+    """
+    probe = value.strip() if isinstance(value, str) else ""
+    return probe.startswith("sk-or-") or "OPENROUTER_API_KEY" in probe.upper()
+
+
 # Retry с экспоненциальным backoff для retry-able ошибок API.
 # 429 (rate limit), 5xx (server errors), timeout, connection errors —
 # временные сбои, шансы успеха при повторе высокие. Safety reject и
@@ -141,6 +153,19 @@ class OpenRouterNode:
                 "image_3": ("IMAGE",),
                 "image_4": ("IMAGE",),
                 "image_5": ("IMAGE",),
+                # ВНИМАНИЕ: ПОСЛЕДНИЙ виджет ноды, и новые виджеты можно добавлять
+                # только ПОСЛЕ него. ComfyUI мапит widgets_values позиционно, поэтому
+                # вставка в середину сдвинет значения во всех сохранённых воркфлоу
+                # (так уже ломался устаревший api_key, см. _looks_like_stale_api_key).
+                # Слоты выше — сокеты (IMAGE / '*' / forceInput), в widgets_values их
+                # нет: у боевых графов ровно 11 значений = 11 required-виджетов.
+                #
+                # fail_soft=True: терминальная ошибка вызова API не поднимается, а
+                # отдаётся выходами (`OPENROUTER_ERROR: ...` + чёрный кадр). Нужно
+                # там, где ветка НЕ обязана ронять весь прогон: экстрактор плана в
+                # segments не должен уносить с собой скан, за который платит юзер.
+                # Дефолт False — прежнее fail-loud поведение для всех воркфлоу.
+                "fail_soft": ("BOOLEAN", {"default": False}),
             }
         }
 
@@ -305,7 +330,62 @@ class OpenRouterNode:
                 labels[f"image_{n}"] = label
         return prompt_text, labels
 
+    # Чёрный кадр мягкого отказа: 64x64 RGB. Не 1x1 (как placeholder text-only
+    # ответов) — вырожденный тензор роняет часть нод на ресайзе и превью, а выход
+    # мягкого отказа обязан быть безопасным для любого потребителя в графе.
+    FAIL_SOFT_IMAGE_SIDE = 64
+    FAIL_SOFT_PREFIX = "OPENROUTER_ERROR"
+
+    @classmethod
+    def _soft_failure(cls, exc):
+        """Кортеж выходов вместо исключения (только при fail_soft=True).
+
+        Ошибка не теряется: она уходит в `Output` строкой с префиксом
+        `OPENROUTER_ERROR` — потребитель различает её по префиксу, а нода-план
+        отдаёт по такому входу белый лист и причину в debug. Остальные текстовые
+        выходы пустые: подставлять туда старые значения нельзя, иначе получится
+        silent-fallback, из-за которого уже утекала reference-картинка.
+        """
+        message = "%s: %s: %s" % (cls.FAIL_SOFT_PREFIX, exc.__class__.__name__, str(exc)[:300])
+        print("[OpenRouter] fail_soft=True — прогон не роняем: %s" % message)
+        side = cls.FAIL_SOFT_IMAGE_SIDE
+        black = torch.zeros((1, side, side, 3), dtype=torch.float32)
+        return (message, black, "", "", "", "")
+
     def generate_response(self, system_prompt, user_message_box, model,
+                         web_search, cheapest, fastest, seed, temperature, pdf_engine, chat_mode,
+                         max_retries=3,
+                         aspect_ratio="auto", image_resolution="auto",
+                         pdf_data=None, user_message_input=None,
+                         image_1=None, image_2=None, image_3=None, image_4=None, image_5=None,
+                         fail_soft=False,
+                         **kwargs):
+        """Точка входа ноды: при fail_soft=False — ровно прежнее поведение (raise).
+
+        Мягкий отказ живёт здесь, а не внутри `_generate_response`, потому что
+        часть терминальных ошибок (исчерпанные ретраи, отсутствующий ключ) летит
+        мимо внутреннего try/except — ловить их надо одним местом на весь вызов.
+        """
+        # Легаси-сдвиг виджетов двигает и fail_soft: он получает значение
+        # max_retries старого графа (int 3 -> True). Мягкий отказ не должен
+        # включаться сам по себе, поэтому гасим его на том же признаке, по
+        # которому `_generate_response` восстанавливает остальные виджеты.
+        if _looks_like_stale_api_key(system_prompt):
+            fail_soft = False
+        try:
+            return self._generate_response(
+                system_prompt, user_message_box, model, web_search, cheapest, fastest,
+                seed, temperature, pdf_engine, chat_mode, max_retries,
+                aspect_ratio=aspect_ratio, image_resolution=image_resolution,
+                pdf_data=pdf_data, user_message_input=user_message_input,
+                image_1=image_1, image_2=image_2, image_3=image_3, image_4=image_4,
+                image_5=image_5, **kwargs)
+        except Exception as exc:
+            if not fail_soft:
+                raise
+            return self._soft_failure(exc)
+
+    def _generate_response(self, system_prompt, user_message_box, model,
                          web_search, cheapest, fastest, seed, temperature, pdf_engine, chat_mode,
                          max_retries=3,
                          aspect_ratio="auto", image_resolution="auto",
@@ -331,7 +411,9 @@ class OpenRouterNode:
         Error paths keep raising RuntimeError (fail loud) — они НЕ возвращают кортеж
         вообще, поэтому диагностические выходы там просто не создаются. Превращать
         raise в return с пустыми строками нельзя: silent-fallback на ошибке API уже
-        приводил к утечке reference-картинки в результат.
+        приводил к утечке reference-картинки в результат. Единственное исключение —
+        явно включённый виджетом `fail_soft`, и обрабатывается оно СНАРУЖИ, в
+        `generate_response`: сюда мягкий отказ не просачивается.
         """
         # --- Compat-шим: устаревший api_key-виджет в старых воркфлоу ---
         # Нода перешла на ключ из ENV (коммит d80c8a2), но воркфлоу, сохранённые
@@ -342,8 +424,7 @@ class OpenRouterNode:
         # значения. Воркфлоу БЕЗ устаревшей строки не затрагиваются (обычный system_prompt
         # не начинается с sk-or-) → оба типа воркфлоу работают без ручной правки.
         # Ключ здесь игнорируется — реальный берётся из ENV (см. _get_openrouter_api_key).
-        _sp_probe = system_prompt.strip() if isinstance(system_prompt, str) else ""
-        if _sp_probe.startswith("sk-or-") or "OPENROUTER_API_KEY" in _sp_probe.upper():
+        if _looks_like_stale_api_key(system_prompt):
             (system_prompt, user_message_box, model, web_search, cheapest,
              fastest, seed, temperature, pdf_engine, chat_mode, max_retries) = (
                 user_message_box, model, web_search, cheapest, fastest,
