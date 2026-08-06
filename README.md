@@ -2,6 +2,48 @@
 
 A custom node for ComfyUI that allows you to interact with OpenRouter's API, providing access to a wide range of models.  
 
+## Ноды Desow (форк)
+
+Помимо апстримной OpenRouter-ноды репозиторий содержит ноды проекта Desow:
+
+| Ключ в `NODE_CLASS_MAPPINGS` | Файлы | Назначение |
+|---|---|---|
+| `LayoutJsonValidator` | `layout_json_validator.py` + `_node.py` | чинит и валидирует layout-JSON от VLM |
+| `DesowIsBlank` | `is_blank.py` + `is_blank_node.py` | проверка «на входе ничего нет» (0 и False — НЕ пусто) |
+| `DesowPlanRender` | `desow_plan/` + `desow_plan_node.py` | строит пустой 2D-план комнаты кодом |
+
+Ключи попадают в JSON воркфлоу — переименование ломает все графы, где нода стоит.
+
+### `DesowPlanRender`: вендоренный код и двойное ведение
+
+Пакет `desow_plan/` — **копия бэкендового кода Desow**, а не самостоятельная
+реализация. На машине ComfyUI бэкенда нет, поэтому логика построения плана
+существует в двух местах:
+
+| Модуль ноды | Источник в репозитории `desow` |
+|---|---|
+| `desow_plan/geometry.py` | `plan2d/geometry.py` (различие: строка импорта) |
+| `desow_plan/merge.py` | `plan2d/merge.py` (различие: строка импорта) |
+| `desow_plan/gate.py` | `plan2d/gate.py` (различие: строка импорта) |
+| `desow_plan/render.py` | `plan2d/render.py` (различие: строка импорта) |
+| `desow_plan/schema_lite.py` | `plan2d/schema.py` (переписан без pydantic, см. докстринг) |
+| `desow_plan/scanner.py` | `layout_openings_match.parse_scan_openings` + `plan2d/extract.extract_json_object` |
+
+**Правило: правки в этих файлах делаются парой** — здесь и в источнике. Расхождение
+двух реализаций опаснее дырки в любой из них: план, построенный в графе, разойдётся
+с планом, построенным бэкендом для того же скана. Шапка каждого файла указывает свой
+источник; `schema_lite.py` перечисляет осознанные отличия (нет pydantic; мебель не
+рисуется; частично битый вход не роняет план, а чинится с пометкой в `debug`).
+
+Зависимости: только Pillow (уже в `requirements.txt`) плюс numpy/torch на конвертацию
+картинки в тензор — оба есть в любой сборке ComfyUI. Сети в ноде нет.
+
+### Тесты
+
+```bash
+cd tests && python -m pytest -q     # без ComfyUI; тесты с torch скипаются
+```
+
 ## Updates
 
 ### 4/5/2026 - Seed, Resolution, Aspect Ratio, Temperature Fix
