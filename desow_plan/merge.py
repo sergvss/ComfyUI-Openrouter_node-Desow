@@ -157,18 +157,52 @@ def merge_with_scanner(scanner: dict, vlm_runs: list[dict]) -> tuple[dict, dict]
     merged_ops: list[dict] = []
     candidates = [op for run in vlm_runs for op in run.get("openings", [])]
     used: list[int] = []
-    for so in scanner_ops:
-        k = _key(so)
-        cand = next((c for c in candidates if _key(c) == k and id(c) not in used), None)
-        if cand is None:
-            # Та же стена, любой тип — берём геометрию, тип от сканера.
-            cand = next((c for c in candidates if c["wall"] == so["wall"] and id(c) not in used), None)
-        if cand is not None:
-            used.append(id(cand))
-            op = copy.deepcopy(cand)
-            op["type"] = so["type"] if norm_type(so["type"]) != norm_type(cand.get("type", "")) else cand["type"]
-            merged_ops.append(op)
-        else:
+
+    # Кандидаты VLM разбираются ФАЗАМИ по всему списку сканера, а не «первым
+    # подходящим» на каждый проём по очереди. Иначе первый же проём уводит
+    # кандидата, который ТОЧНО соответствует другому: scanner [door/left,
+    # door/back] + VLM [door/back] → left забирал бы дверь back как «спор о
+    # стене», а настоящая back-дверь уходила бы в дефолт с потерей геометрии.
+    #   Фаза 1 — точное совпадение (тип + стена): геометрия VLM применима как есть.
+    #   Фаза 2 — та же стена, другой тип: геометрия применима, тип берём от сканера.
+    #   Фаза 3 — тот же тип, другая стена: это спор о стене (один проём, прочитанный
+    #            дважды); геометрия VLM НЕприменима — она про другую стену → дефолт.
+    matched: dict[int, dict] = {}
+    disputed: dict[int, dict] = {}
+
+    def _assign(predicate, store: dict) -> None:
+        for si, so in enumerate(scanner_ops):
+            if si in matched or si in disputed:
+                continue
+            cand = next((c for c in candidates if id(c) not in used and predicate(so, c)), None)
+            if cand is not None:
+                used.append(id(cand))
+                store[si] = cand
+
+    _assign(lambda so, c: _key(c) == _key(so), matched)
+    _assign(lambda so, c: c.get("wall") == so["wall"], matched)
+    # `passage` не спариваем: сканер открытые проходы вообще не эмитит, поэтому
+    # любой passage от VLM — законная добавка, а не спорное чтение.
+    _assign(
+        lambda so, c: norm_type(so["type"]) in PAIRABLE_TYPES
+        and norm_type(c.get("type", "")) == norm_type(so["type"]),
+        disputed,
+    )
+
+    # Проёмы с реальной геометрией VLM раскладываются ПЕРВЫМИ и целиком: дефолты
+    # обязаны обходить их все, а не только те, что оказались раньше по порядку
+    # сканера (иначе дефолт садится поверх проёма, который приедет следом).
+    resolved: dict[int, dict] = {}
+    for si, cand in matched.items():
+        so = scanner_ops[si]
+        op = copy.deepcopy(cand)
+        op["type"] = so["type"] if norm_type(so["type"]) != norm_type(cand.get("type", "")) else cand["type"]
+        resolved[si] = op
+    merged_ops = list(resolved.values())   # занятость для дефолтов; порядок соберём в конце
+
+    for si, so in enumerate(scanner_ops):
+        if si not in matched:
+            k = _key(so)
             room = base.get("room", {})
             nt = norm_type(so["type"])
             # Спор о стене: тот же тип проёма, но VLM и сканер назвали разные стены.
@@ -176,17 +210,8 @@ def merge_with_scanner(scanner: dict, vlm_runs: list[dict]) -> tuple[dict, dict]
             # v83: door/left сканера + door/back VLM дали две двери в комнате с
             # одной). Спариваем 1:1, стена — от сканера (состав всегда его),
             # позиция VLM неприменима (она про другую стену) -> дефолт ниже.
-            # `passage` не спариваем: сканер их не эмитит вообще, а значит любой
-            # passage VLM — законная добавка, а не спорное чтение.
-            twin = None
-            if nt in PAIRABLE_TYPES:
-                twin = next(
-                    (c for c in candidates
-                     if id(c) not in used and norm_type(c.get("type", "")) == nt),
-                    None,
-                )
+            twin = disputed.get(si)
             if twin is not None:
-                used.append(id(twin))
                 meta["paired_wall_dispute"].append((nt, twin.get("wall"), so["wall"]))
             placement = _place_default(
                 room, merged_ops, so["wall"], DEFAULT_WIDTH_DW.get(nt, 1.0), nt
@@ -209,9 +234,14 @@ def merge_with_scanner(scanner: dict, vlm_runs: list[dict]) -> tuple[dict, dict]
                 else:
                     op["swing"] = {"hinge": side, "direction": "in"}
             merged_ops.append(op)
+            resolved[si] = op
             meta["defaults_used"].append(k)
             if wall != so["wall"]:
                 meta["moved_to_wall"].append((k, wall))
+
+    # Итоговый порядок — как у сканера (matched-проёмы выше собирались вперёд ради
+    # занятости, а не ради порядка).
+    merged_ops = [resolved[si] for si in sorted(resolved)]
     # Добавки VLM сверх сканера (из первого прогона) остаются.
     pool = [_key(o) for o in scanner_ops]
     for op in vlm_runs[0].get("openings", []):

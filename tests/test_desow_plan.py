@@ -308,6 +308,35 @@ def test_merge_pairs_same_type_on_disputed_wall():
     assert meta["paired_wall_dispute"] == [("door", "back", "left")]
 
 
+def test_merge_exact_match_wins_over_wall_dispute():
+    # Точные совпадения резервируются ДО спаривания: сканер [door/left, door/back],
+    # VLM [door/back] — геометрию VLM получает back, а left уходит в дефолт.
+    # Регресс: одноproходный матчинг отдавал VLM-дверь первому проёму сканера.
+    vlm = plan_with(openings=[
+        {"type": "door", "wall": "back", "offset_dw": 3.1, "width_dw": 1.0,
+         "swing": {"hinge": "left", "direction": "in"}},
+    ])
+    scanner = {"openings": [{"type": "door", "wall": "left"}, {"type": "door", "wall": "back"}]}
+    merged, meta = merge_with_scanner(scanner, [vlm])
+
+    by_wall = {o["wall"]: o for o in merged["openings"]}
+    assert set(by_wall) == {"left", "back"}
+    assert by_wall["back"]["offset_dw"] == 3.1
+    assert meta["paired_wall_dispute"] == []
+    assert meta["defaults_used"] == [("door", "left")]
+    assert_no_overlaps(merged)
+
+
+def test_merge_default_avoids_later_exact_match():
+    # Дефолт обходит проёмы с реальной геометрией, даже если те идут позже по списку.
+    vlm = plan_with(openings=[{"type": "window", "wall": "right", "offset_dw": 2.8, "width_dw": 1.2}])
+    scanner = {"openings": [{"type": "door", "wall": "right"}, {"type": "window", "wall": "right"}]}
+    merged, _meta = merge_with_scanner(scanner, [vlm])
+    window = next(o for o in merged["openings"] if o["type"].endswith("window"))
+    assert window["offset_dw"] == 2.8
+    assert_no_overlaps(merged)
+
+
 def test_merge_does_not_pair_passage_or_across_types():
     # passage сканер не эмитит вообще, а окно и дверь — разные проёмы: обе записи
     # VLM обязаны остаться добавками, иначе спаривание съест реальные проёмы.
