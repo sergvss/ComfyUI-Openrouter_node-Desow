@@ -27,6 +27,7 @@ from .geometry import (
     room_polygon_dw,
 )
 from .schema_lite import (
+    CONTACT_TOL_DW,
     DOOR_APPROACH_M,
     DOOR_FRAME_CLEAR_M,
     DW_M,
@@ -49,8 +50,15 @@ def rect_of(f: dict) -> tuple[float, float, float, float]:
     return (cx - w_dw / 2, cy - d_dw / 2, cx + w_dw / 2, cy + d_dw / 2)
 
 
-def _rects_overlap(a, b) -> bool:
-    return a[0] < b[2] - 1e-6 and b[0] < a[2] - 1e-6 and a[1] < b[3] - 1e-6 and b[1] < a[3] - 1e-6
+def _rects_overlap(a, b, tol: float = CONTACT_TOL_DW) -> bool:
+    """Пересекаются ли прямоугольники ГЛУБЖЕ допуска касания.
+
+    Допуск общий для всех потребителей (простенки, попарные пересечения, зоны
+    окна и двери): везде вопрос один — «предметы стоят рядом или один залез на
+    другой». Касание и наложение в миллиметры — цена округления координат
+    моделью, а не ошибка расстановки (см. CONTACT_TOL_M в схеме).
+    """
+    return a[0] < b[2] - tol and b[0] < a[2] - tol and a[1] < b[3] - tol and b[1] < a[3] - tol
 
 
 def _rect_seg_dist(rect, p0, p1, samples: int = 24) -> float:
@@ -167,18 +175,25 @@ def validate_furniture(room_data: dict, furniture: list) -> list[str]:
     for f in furniture:
         x0, y0, x1, y1 = rect_of(f)
         if poly is not None:
-            eps = 1e-4
+            # Углы вжимаются внутрь на допуск касания: предмет, вставший вплотную
+            # к грани полигона, проверяется как стоящий внутри неё.
+            eps = min(CONTACT_TOL_DW, (x1 - x0) / 2, (y1 - y0) / 2)
             corners = [(x0 + eps, y0 + eps), (x1 - eps, y0 + eps), (x1 - eps, y1 - eps), (x0 + eps, y1 - eps)]
             if not all(inside_polygon(poly, cx_, cy_) for cx_, cy_ in corners):
                 errs.append(
                     f"{f['kind']} выходит за пределы L-полигона комнаты: "
                     f"[{x0:.2f},{y0:.2f},{x1:.2f},{y1:.2f}]"
                 )
-        elif x0 < -1e-6 or y0 < -1e-6 or x1 > W + 1e-6 or y1 > D + 1e-6:
-            errs.append(
-                f"{f['kind']} выходит за пределы комнаты: "
-                f"[{x0:.2f},{y0:.2f},{x1:.2f},{y1:.2f}] room {W}x{D}"
-            )
+        else:
+            # Симметрично по всем четырём границам. Печатаем ещё и величину
+            # выхода: округление до сотых в dw само по себе прячет сантиметры и
+            # делает сообщение неправдоподобным («3.80 при ширине 3.8»).
+            out_dw = max(-x0, -y0, x1 - W, y1 - D)
+            if out_dw > CONTACT_TOL_DW:
+                errs.append(
+                    f"{f['kind']} выходит за пределы комнаты на {out_dw * DW_M * 1000:.0f} мм: "
+                    f"[{x0:.2f},{y0:.2f},{x1:.2f},{y1:.2f}] room {W}x{D}"
+                )
         rects.append((f["kind"], x0, y0, x1, y1))
 
     # Простенки — препятствия: никакая мебель (включая ковёр) их не пересекает.

@@ -24,7 +24,8 @@ from desow_plan.furnish import (
 )
 from desow_plan.pipeline import FurnishFailed
 from desow_plan.render import CANVAS
-from desow_plan.schema_lite import PlanDataError, validate_furniture_item
+from desow_plan.schema_lite import CONTACT_TOL_DW, DW_M, PlanDataError, validate_furniture_item
+from desow_plan.validate import validate_furniture
 
 # Боевой кадр living_room (прототип hybrid-proto): 4.8x4.6 dw, окно слева, дверь справа.
 PLAN = {
@@ -126,6 +127,98 @@ def test_parse_furniture_drops_item_far_outside_room():
         GOOD_FURNITURE[1],
     ])
     assert [i["kind"] for i in parse_furniture(text, PLAN)] == ["rug"]
+
+
+# ── допуск касания (мебель вплотную к стене) ─────────────────────────
+
+# Комната боевого кадра fin379: на нём валидатор браковал флеш-постановку.
+TOL_ROOM = {"room": {"shape": "rectangle", "width_dw": 3.8, "depth_dw": 7.2}, "openings": []}
+WARDROBE_HALF_DW = 0.6 / DW_M / 2      # полуглубина шкафа 0.6 м
+
+
+def wardrobe_at(cx, cy, rotation=0):
+    return {"kind": "wardrobe", "center_dw": [cx, cy], "size_m": [0.6, 1.6], "rotation": rotation}
+
+
+@pytest.mark.parametrize("label, center, rotation", [
+    ("right", [3.8 - WARDROBE_HALF_DW, 3.0], 0),
+    ("right, центр округлён моделью до сотых", [3.45, 3.0], 0),
+    ("left", [WARDROBE_HALF_DW, 3.0], 0),
+    ("left, центр округлён", [0.35, 3.0], 0),
+    ("back", [2.0, WARDROBE_HALF_DW], 90),
+    ("back, центр округлён", [2.0, 0.35], 90),
+    ("front", [2.0, 7.2 - WARDROBE_HALF_DW], 90),
+    ("front, центр округлён", [2.0, 6.85], 90),
+])
+def test_flush_against_every_wall_is_legal(label, center, rotation):
+    """Мебель вплотную к стене — норма жизни, а не выход за пределы комнаты.
+
+    Регресс серии v2: шкаф `[3.10,4.26,3.80,6.14]` при ширине 3.8 браковался как
+    вышедший наружу. Точная флеш-постановка модели недоступна — центр она
+    округляет до 0.01 dw, а 0.6 м в dw это 0.70588..., поэтому хвост в миллиметры
+    неизбежен.
+    """
+    assert validate_furniture(TOL_ROOM, [wardrobe_at(*center, rotation=rotation)]) == [], label
+
+
+@pytest.mark.parametrize("over_m", [0.02, 0.05, 0.5])
+def test_real_overflow_is_still_caught(over_m):
+    """2 см и больше — уже нарушение, и величина выхода видна в тексте."""
+    item = wardrobe_at(3.8 - WARDROBE_HALF_DW + over_m / DW_M, 3.0)
+    errs = validate_furniture(TOL_ROOM, [item])
+    assert len(errs) == 1 and "выходит за пределы комнаты" in errs[0]
+    assert "на %.0f мм" % (over_m * 1000) in errs[0], errs
+
+
+def test_tolerance_is_one_centimetre():
+    """Допуск заявлен явно: меньше сантиметра — не нарушение, больше двух — нарушение."""
+    assert 0.009 < CONTACT_TOL_DW * DW_M < 0.011
+
+
+L_ROOM = {
+    "room": {"shape": "l_shape", "width_dw": 6.0, "depth_dw": 5.0,
+             "polygon_dw": [[0, 0], [6, 0], [6, 3], [4, 3], [4, 5], [0, 5]]},
+    "openings": [],
+}
+
+
+def test_flush_against_l_polygon_edge_is_legal():
+    """У L-комнаты граница проверяется полигоном — допуск должен работать и там."""
+    flush = {"kind": "wardrobe", "center_dw": [6.0 - WARDROBE_HALF_DW, 1.5],
+             "size_m": [0.6, 1.6], "rotation": 0}
+    assert validate_furniture(L_ROOM, [flush]) == []
+    outside = {"kind": "wardrobe", "center_dw": [5.0, 4.0], "size_m": [1.0, 1.0], "rotation": 0}
+    assert any("L-полигона" in e for e in validate_furniture(L_ROOM, [outside]))
+
+
+PART_ROOM = {
+    "room": {"shape": "rectangle", "width_dw": 6.8, "depth_dw": 5.2},
+    "openings": [],
+    "partitions": [{"attach": "back", "offset_dw": 4.1, "length_dw": 1.8}],
+}
+
+
+def test_furniture_touching_partition_is_legal_but_overlap_is_not():
+    """Простенок толщиной 0.25 dw: встать вплотную можно, залезть на него нельзя."""
+    edge = 4.1 - 0.25 / 2                       # левая грань простенка
+    half_w = 0.5 / DW_M / 2                     # полуширина комода вдоль x
+    touching = {"kind": "dresser", "center_dw": [edge - half_w, 0.9],
+                "size_m": [0.5, 1.0], "rotation": 0}
+    assert validate_furniture(PART_ROOM, [touching]) == []
+    overlapping = {"kind": "dresser", "center_dw": [edge - half_w + 0.05 / DW_M, 0.9],
+                   "size_m": [0.5, 1.0], "rotation": 0}
+    assert any("простенок" in e for e in validate_furniture(PART_ROOM, [overlapping]))
+
+
+def test_furniture_side_by_side_is_legal_but_overlap_is_not():
+    """Два предмета борт к борту — норма; допуск не должен прощать реальный нахлёст."""
+    left = {"kind": "dresser", "center_dw": [1.0, 1.0], "size_m": [1.0, 0.5], "rotation": 0}
+    side = 1.0 / DW_M                            # ширина комода в dw
+    right = {"kind": "desk", "center_dw": [1.0 + side, 1.0], "size_m": [1.0, 0.5], "rotation": 0}
+    assert validate_furniture(TOL_ROOM, [left, right]) == []
+    over = {"kind": "desk", "center_dw": [1.0 + side - 0.1 / DW_M, 1.0],
+            "size_m": [1.0, 0.5], "rotation": 0}
+    assert any("пересечение" in e for e in validate_furniture(TOL_ROOM, [left, over]))
 
 
 # ── цикл расстановки ─────────────────────────────────────────────────
