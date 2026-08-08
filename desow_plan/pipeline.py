@@ -32,6 +32,25 @@ def blank_png():
     return buf.getvalue()
 
 
+def render_camera_png(plan_json):
+    """Тот же план, но с маркером камеры: PNG-байты (четвёртый выход ноды).
+
+    Отдельным проходом по уже собранному `plan_json`, а не вторым возвратом
+    `build_empty_plan`: основной выход обязан остаться прежним БАЙТ-В-БАЙТ — на
+    нём бэкенд расставляет мебель, и цветной маркер там был бы помехой.
+
+    Сбой камеры не имеет права задеть основные выходы, поэтому исключения
+    гасятся здесь целиком: пустой план -> белый лист.
+    """
+    if not plan_json:
+        return blank_png()
+    try:
+        png, _meta = render_plan(json.loads(plan_json), with_furniture=False, draw_camera=True)
+    except Exception:
+        return blank_png()
+    return png
+
+
 def _fmt_ops(openings):
     """`[door/front, window/back]` — компактный состав проёмов для debug."""
     return "[%s]" % ", ".join("%s/%s" % (o.get("type"), o.get("wall")) for o in openings) if openings else "[]"
@@ -112,6 +131,8 @@ def build_empty_plan(extraction_json, scanner_openings_json="", room_type=""):
         debug.append("plan: ОШИБКА render_failed: %s: %s" % (exc.__class__.__name__, exc))
         return blank_png(), "", "\n".join(debug)
     debug.append("render: %s" % json.dumps(render_meta, ensure_ascii=False))
+
+    debug.append("camera: %s" % json.dumps(plan["camera"], ensure_ascii=False))
 
     if room_type:
         # Тип комнаты сквозной: геометрию не меняет, но нужен фазе расстановки.

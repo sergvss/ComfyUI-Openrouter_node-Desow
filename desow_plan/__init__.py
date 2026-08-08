@@ -8,7 +8,7 @@
 Зависимости: только Pillow (есть в любой сборке ComfyUI). Сети здесь нет —
 экстракцию делает OpenRouter-нода графа.
 """
-from .pipeline import blank_png, build_empty_plan
+from .pipeline import blank_png, build_empty_plan, render_camera_png
 from .schema_lite import PlanDataError
 
-__all__ = ["build_empty_plan", "blank_png", "PlanDataError"]
+__all__ = ["build_empty_plan", "blank_png", "render_camera_png", "PlanDataError"]

@@ -7,14 +7,19 @@ import io
 import json
 
 import pytest
-from PIL import Image
+from PIL import Image, ImageChops
 
-from desow_plan import blank_png, build_empty_plan
+from desow_plan import blank_png, build_empty_plan, render_camera_png
 from desow_plan.gate import ensure_door_and_window, resolve_opening_conflicts
 from desow_plan.merge import merge_with_scanner, scanner_openings_from_scan
-from desow_plan.render import render_plan
+from desow_plan.render import CANVAS, render_plan
 from desow_plan.scanner import parse_scanner_openings
-from desow_plan.schema_lite import MIN_CORNER_CLEARANCE_DW, PlanDataError, validate_plan
+from desow_plan.schema_lite import (
+    DEFAULT_CAMERA,
+    MIN_CORNER_CLEARANCE_DW,
+    PlanDataError,
+    validate_plan,
+)
 
 
 ROOM = {"shape": "rectangle", "width_dw": 4.0, "depth_dw": 5.0}
@@ -58,7 +63,7 @@ def assert_no_overlaps(plan, *, clearance=0.0):
 
 def test_minimal_plan_is_canonical():
     plan, notes = validate_plan(plan_with())
-    assert plan == {"room": ROOM, "openings": []}
+    assert plan == {"room": ROOM, "openings": [], "camera": DEFAULT_CAMERA}
     assert notes == []
 
 
@@ -173,6 +178,38 @@ def test_partitions_valid_and_broken():
     ]))
     assert len(plan["partitions"]) == 2
     assert len(notes) == 3
+
+
+def test_camera_defaults_to_the_front_wall_centre():
+    """Блок камеры есть у КАЖДОГО плана: конвенция camera-relative — это данные."""
+    plan, notes = validate_plan(plan_with())
+    assert plan["camera"] == DEFAULT_CAMERA
+    assert plan["camera"] == {"wall": "front", "position": 0.5, "direction": "up",
+                              "marker": "orange_sector"}
+    assert notes == []
+
+
+def test_camera_values_from_input_are_kept():
+    plan, notes = validate_plan(plan_with(camera={"wall": "left", "position": "0.25", "direction": "right"}))
+    assert plan["camera"]["wall"] == "left"
+    assert plan["camera"]["position"] == 0.25          # числовая строка принимается
+    assert plan["camera"]["direction"] == "right"
+    assert notes == []
+
+
+@pytest.mark.parametrize("camera", [
+    "front",                                   # не объект
+    {"wall": "ceiling"},                       # стены такой нет
+    {"position": 1.4},                         # доля стены вне 0..1
+    {"position": "нет"},
+    {"direction": "backwards"},
+    {"marker": "red_arrow"},                   # символ рисует рендер, не модель
+])
+def test_broken_camera_degrades_to_default(camera):
+    """Камера не имеет права уронить план: любое битое поле -> дефолт + пометка."""
+    plan, notes = validate_plan(plan_with(camera=camera))
+    assert plan["camera"] == DEFAULT_CAMERA
+    assert any("camera" in n for n in notes), notes
 
 
 def test_furniture_is_ignored_with_note():
@@ -508,6 +545,96 @@ def test_rendered_plan_is_not_blank():
         assert image.convert("L").getextrema()[0] < 40      # есть чёрные стены
 
 
+# ── камера на листе ──────────────────────────────────────────────────
+
+CAM_PLAN = plan_with(
+    openings=[{"type": "door", "wall": "left", "offset_dw": 1.2, "width_dw": 1.0},
+              {"type": "window", "wall": "back", "offset_dw": 2.0, "width_dw": 1.6}],
+    camera=dict(DEFAULT_CAMERA),
+)
+
+
+def chromatic(png, step=3):
+    """Цветные пиксели листа. На чистом плане их нет: он строго трёхтоновый."""
+    with Image.open(io.BytesIO(png)) as image:
+        rgb = image.convert("RGB")
+        px = rgb.load()
+        w, h = rgb.size
+        return [(x, y) for y in range(0, h, step) for x in range(0, w, step)
+                if max(px[x, y]) - min(px[x, y]) > 20]
+
+
+def test_clean_sheet_stays_three_tone_greyscale():
+    """Без флага камера не рисуется, даже если блок в плане есть."""
+    png, _ = render_plan(CAM_PLAN, with_furniture=False)
+    with Image.open(io.BytesIO(png)) as image:
+        assert image.mode == "L"
+    assert chromatic(png) == []
+    without_block = {k: v for k, v in CAM_PLAN.items() if k != "camera"}
+    assert render_plan(without_block, with_furniture=False)[0] == png
+
+
+def test_camera_sector_is_the_only_colour_on_the_sheet():
+    png, _ = render_plan(CAM_PLAN, with_furniture=False, draw_camera=True)
+    spots = chromatic(png)
+    assert spots, "сектор обзора не нарисован"
+    with Image.open(io.BytesIO(png)) as image:
+        px = image.convert("RGB").load()
+    r, g, b = px[spots[len(spots) // 2]]
+    assert r > g > b, (r, g, b)          # персиково-оранжевый, а не любой цвет
+
+
+def test_camera_dot_sits_at_the_front_wall_centre():
+    """Маркер точки съёмки — в нижней зоне листа, по центру front-стены."""
+    plain, _ = render_plan(CAM_PLAN, with_furniture=False)
+    dot, _ = render_plan(CAM_PLAN, with_furniture=False, draw_camera=True, camera_style="dot")
+    assert chromatic(dot) == []          # style="dot" — без сектора
+    with Image.open(io.BytesIO(plain)) as a, Image.open(io.BytesIO(dot)) as b:
+        box = ImageChops.difference(a.convert("RGB"), b.convert("RGB")).getbbox()
+    w, h = CANVAS
+    x0, y0, x1, y1 = box
+    assert y0 > h * 0.6, box                             # нижняя кромка: камера за кадром
+    assert abs((x0 + x1) / 2 - w / 2) < w * 0.05, box    # центр стены
+    assert (x1 - x0) < w * 0.1 and (y1 - y0) < h * 0.1, box
+
+
+def test_camera_position_moves_the_marker_along_the_wall():
+    left = {**CAM_PLAN, "camera": {**DEFAULT_CAMERA, "position": 0.2}}
+    right = {**CAM_PLAN, "camera": {**DEFAULT_CAMERA, "position": 0.8}}
+    boxes = []
+    for plan in (left, right):
+        png, _ = render_plan(plan, with_furniture=False, draw_camera=True, camera_style="dot")
+        plain, _ = render_plan(plan, with_furniture=False)
+        with Image.open(io.BytesIO(plain)) as a, Image.open(io.BytesIO(png)) as b:
+            boxes.append(ImageChops.difference(a.convert("RGB"), b.convert("RGB")).getbbox())
+    assert boxes[0][0] < CANVAS[0] / 2 < boxes[1][0], boxes
+
+
+def test_camera_sector_goes_under_the_furniture():
+    """Красится только пол: предмет, стоящий в секторе, остаётся нетронутым."""
+    empty, _ = render_plan(CAM_PLAN, with_furniture=False, draw_camera=True)
+    furnished, _ = render_plan(
+        {**CAM_PLAN, "furniture": [{"kind": "bed_double", "center_dw": [2.0, 2.4],
+                                    "size_m": [1.6, 2.05], "rotation": 0}]},
+        with_furniture=True, draw_camera=True,
+    )
+    assert len(chromatic(furnished)) < len(chromatic(empty)) * 0.9
+
+
+def test_render_camera_png_matches_the_plan_json():
+    _, plan_json, _ = build_empty_plan(EXTRACTION, "", "")
+    png = render_camera_png(plan_json)
+    assert png_size(png) == (1152, 928)
+    assert chromatic(png), "камеры на четвёртом выходе нет"
+
+
+@pytest.mark.parametrize("plan_json", ["", "не json", '{"room": {}}'])
+def test_render_camera_png_never_raises(plan_json):
+    """Сбой камеры не имеет права задеть основные выходы ноды."""
+    with Image.open(io.BytesIO(render_camera_png(plan_json))) as image:
+        assert image.convert("L").getextrema() == (255, 255)
+
+
 # ── конвейер целиком ─────────────────────────────────────────────────
 
 EXTRACTION = json.dumps({
@@ -522,9 +649,11 @@ def test_pipeline_happy_path():
     types = {o["type"] for o in plan["openings"]}
     assert "window" in types and "door" in types          # дверь вставил гейт
     assert plan["room_type"] == "bedroom"
+    assert plan["camera"] == DEFAULT_CAMERA               # камера уезжает в сохранённый план
     assert png_size(png) == (1152, 928)
     assert debug.startswith("plan: ok")
     assert "gate: door_inserted" in debug
+    assert '"marker": "orange_sector"' in debug
 
 
 def test_pipeline_uses_scanner_composition():
@@ -675,9 +804,21 @@ def test_node_returns_image_tensor():
         pytest.skip("в sys.modules заглушка torch, а не настоящий пакет")
     from desow_plan_node import DesowPlanRender
 
-    image, plan_json, debug = DesowPlanRender().render(EXTRACTION, "", "bedroom")
+    image, plan_json, debug, plan_camera = DesowPlanRender().render(EXTRACTION, "", "bedroom")
     assert image.shape == (1, 928, 1152, 3)                # [batch, H, W, RGB]
     assert str(image.dtype) == "torch.float32"
     assert 0.0 <= float(image.min()) and float(image.max()) <= 1.0
     assert json.loads(plan_json)["room"]["width_dw"] == 3.8
-    assert debug.startswith("plan: ok")
+    # Четвёртый выход — тот же лист с камерой: та же форма, но не тот же тензор.
+    assert plan_camera.shape == image.shape
+    assert not bool((plan_camera == image).all())
+
+
+def test_node_output_contract_is_append_only():
+    """Связи в JSON воркфлоу позиционные: порядок выходов менять нельзя."""
+    pytest.importorskip("torch", reason="обёртка импортирует torch")
+    pytest.importorskip("numpy")
+    from desow_plan_node import DesowPlanRender
+
+    assert DesowPlanRender.RETURN_NAMES == ("image", "plan_json", "debug", "plan_camera")
+    assert DesowPlanRender.RETURN_TYPES == ("IMAGE", "STRING", "STRING", "IMAGE")

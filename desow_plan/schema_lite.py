@@ -40,6 +40,17 @@ SHAPES = frozenset({"rectangle", "l_shape"})
 ATTACH_NAMES = frozenset({"back", "front", "left", "right", "free"})
 SWING_DIRECTIONS = frozenset({"in", "out"})
 
+# Камера: где стоит точка съёмки и куда смотрит НА ЛИСТЕ (не в мире).
+CAMERA_DIRECTIONS = frozenset({"up", "down", "left", "right"})
+# Символ маркера: тёмная точка-ромб + полупрозрачный оранжевый сектор обзора.
+# Поле нужно потребителю плана — по нему он пишет легенду в промпт («the dot marks
+# the camera, the orange wedge marks what it sees», docs/design/CAMERA_ON_PLAN_RESEARCH.md).
+CAMERA_MARKERS = frozenset({"orange_sector"})
+# Конвенция плана camera-relative: камера у front-стены (нижняя кромка листа),
+# смотрит в глубину кадра. Пока константа, но живёт данными: положение камеры
+# на стене будет задавать пользователь.
+DEFAULT_CAMERA = {"wall": "front", "position": 0.5, "direction": "up", "marker": "orange_sector"}
+
 # Ширина проёма по умолчанию, когда позицию неоткуда взять (fallback мержа и гейт).
 DEFAULT_WIDTH_DW = {"door": 1.0, "window": 1.6, "passage": 1.0}
 
@@ -239,6 +250,42 @@ def validate_openings(raw, notes):
     return out
 
 
+# ── Камера ───────────────────────────────────────────────────────────
+
+def validate_camera(raw, notes):
+    """Точка съёмки -> канонический dict. Битые значения чинятся дефолтом.
+
+    Камера — не декорация, а часть контракта плана: по ней рендер ставит маркер
+    ракурса, а потребитель плана пишет легенду в промпт. Поэтому блок есть у
+    КАЖДОГО плана, даже если во входе его не было.
+    """
+    camera = dict(DEFAULT_CAMERA)
+    if raw is None:
+        return camera
+    if not isinstance(raw, dict):
+        notes.append("camera: ожидался объект, получено %s -> дефолт" % type(raw).__name__)
+        return camera
+    if raw.get("wall") in WALL_NAMES:
+        camera["wall"] = raw["wall"]
+    elif raw.get("wall") is not None:
+        notes.append("camera.wall=%r не из словаря -> front" % (raw.get("wall"),))
+    if raw.get("position") is not None:
+        try:
+            # Доля длины стены, а не dw: камера ездит по стене любой длины.
+            camera["position"] = _length(
+                raw.get("position"), "camera.position", minimum=0.0, allow_min=True, maximum=1.0
+            )
+        except PlanDataError as exc:
+            notes.append("%s -> %g" % (exc, DEFAULT_CAMERA["position"]))
+    if raw.get("direction") in CAMERA_DIRECTIONS:
+        camera["direction"] = raw["direction"]
+    elif raw.get("direction") is not None:
+        notes.append("camera.direction=%r не из словаря -> up" % (raw.get("direction"),))
+    if raw.get("marker") is not None and raw.get("marker") not in CAMERA_MARKERS:
+        notes.append("camera.marker=%r не из словаря -> %s" % (raw.get("marker"), DEFAULT_CAMERA["marker"]))
+    return camera
+
+
 # ── Простенки ────────────────────────────────────────────────────────
 
 def validate_partitions(raw, notes):
@@ -303,6 +350,7 @@ def validate_plan(raw):
     plan = {
         "room": validate_room(raw.get("room"), notes),
         "openings": validate_openings(raw.get("openings"), notes),
+        "camera": validate_camera(raw.get("camera"), notes),
     }
     partitions = validate_partitions(raw.get("partitions"), notes)
     if partitions:

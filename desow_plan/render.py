@@ -9,7 +9,9 @@
 - дверь: разрыв в стене + полотно (тонкий белый прямоугольник с контуром) + четвертьдуга;
 - окно: разрыв + линии по граням стены + двойной штрих + торцевые перемычки;
 - проход (passage): чистый разрыв в цвет пола;
-- мебель: белая заливка, тонкий чёрный контур, без текста.
+- мебель: белая заливка, тонкий чёрный контур, без текста;
+- камера (только `draw_camera=True`): тёмный ромб + полупрозрачный оранжевый
+  сектор обзора — единственный цветной элемент листа.
 
 Замкнутость контура, равнотолщинность стен и поля листа гарантированы построением,
 а не промптом: рендер рисует ровно то, что есть в JSON.
@@ -19,9 +21,17 @@ from __future__ import annotations
 import io
 import math
 
-from PIL import Image, ImageDraw
+from PIL import Image, ImageChops, ImageDraw
 
-from .geometry import inside_polygon, partition_rect_dw, room_polygon_dw, wall_edge, wall_params
+from .geometry import (
+    clamp,
+    inside_polygon,
+    partition_rect_dw,
+    room_polygon_dw,
+    wall_edge,
+    wall_params,
+    wall_span,
+)
 from .schema_lite import DW_M, WALL_T_DW
 
 # --- константы графстандарта (в финальных пикселях) ---
@@ -34,12 +44,34 @@ SS = 4          # суперсэмплинг для гладких дуг
 THIN = 2        # тонкая линия в финальных px
 LEAF_T = 7      # толщина дверного полотна в px
 
+# --- маркер камеры (рисуется только в camera-версии листа) ---
+# Канон приёма «камера на плане» для Nano Banana: контрастная точка стояния плюс
+# явный указатель направления (docs/design/CAMERA_ON_PLAN_RESEARCH.md). У нас это
+# ромб + широкий сектор обзора; сектор полупрозрачный, чтобы мебель читалась сквозь него.
+CAM_SECTOR_RGB = (245, 165, 122)
+CAM_SECTOR_ALPHA = 90       # ~35%: заливка видна, но не спорит с чертежом
+CAM_FOV_DEG = 75.0          # раскрытие сектора обзора
+CAM_DOT_DW = 0.11           # полудиагональ ромба-маркера
+# Направление взгляда НА ЛИСТЕ (не в мире): y вниз, поэтому "up" — это -y.
+CAM_DIR_VEC = {"up": (0.0, -1.0), "down": (0.0, 1.0), "left": (-1.0, 0.0), "right": (1.0, 0.0)}
+CAMERA_STYLES = ("sector", "dot")   # "dot" — только точка, без сектора
 
-def render_plan(data: dict, *, with_furniture: bool = True) -> tuple[bytes, dict]:
+
+def render_plan(
+    data: dict,
+    *,
+    with_furniture: bool = True,
+    draw_camera: bool = False,
+    camera_style: str = "sector",
+) -> tuple[bytes, dict]:
     """Рисует план и возвращает (png_bytes, meta).
 
     meta: масштаб px/dw, толщина стены в px, габарит комнаты в dw и в метрах,
     флаг `scale_fallback` (в комнате нет двери — дверная линейка недоступна).
+
+    `draw_camera` добавляет маркер точки съёмки (блок `camera` плана). Без него
+    лист остаётся строго трёхтоновым и БАЙТ-В-БАЙТ прежним: на чистом плане
+    расставляется мебель, и любой цветной пиксель на нём был бы помехой.
     """
     room = data["room"]
     poly = room_polygon_dw(room)
@@ -211,6 +243,10 @@ def render_plan(data: dict, *, with_furniture: bool = True) -> tuple[bytes, dict
         for f in data.get("furniture", []):
             _draw_furniture(dr, P, s, f)
 
+    # 5) Камера: маркер ракурса поверх готового чертежа.
+    if draw_camera:
+        img = _paint_camera(img, data, poly, P, s, style=camera_style)
+
     final = img.resize(CANVAS, Image.LANCZOS)
     buf = io.BytesIO()
     final.save(buf, format="PNG")
@@ -223,6 +259,63 @@ def render_plan(data: dict, *, with_furniture: bool = True) -> tuple[bytes, dict
         "scale_fallback": not has_door,
     }
     return buf.getvalue(), meta
+
+
+def _paint_camera(img, data: dict, poly: list, P, s: float, *, style: str = "sector"):
+    """Накладывает маркер камеры на готовый лист и возвращает RGB-изображение.
+
+    Сектор заливается ТОЛЬКО по чистому полу (маска «пиксель ровно цвета пола»):
+    так он ложится ПОД мебель и под символы проёмов — те остаются нетронутыми и
+    читаются сквозь заливку, а не тонут в ней. Ромб точки рисуется последним:
+    его не должен закрыть предмет, стоящий у стены.
+
+    Работает по блоку `camera` плана; блока нет (план построен до его появления) —
+    берётся конвенция camera-relative: центр front-стены, взгляд в глубину листа.
+    """
+    room = data["room"]
+    cam = data.get("camera") or {}
+    wall = cam.get("wall") if cam.get("wall") in ("back", "front", "left", "right") else "front"
+    try:
+        position = clamp(float(cam.get("position", 0.5)), 0.0, 1.0)
+    except (TypeError, ValueError):
+        position = 0.5
+    dx, dy = CAM_DIR_VEC.get(cam.get("direction"), CAM_DIR_VEC["up"])
+
+    # Точка стояния: доля длины стены -> точка на её ВНУТРЕННЕЙ грани (полигон
+    # комнаты и есть внутренняя грань — стены рисуются наружу от него).
+    start, end = wall_span(room, wall)
+    i, j, local = wall_edge(room, wall, poly, start + position * (end - start))
+    (ax, ay), (ux, uy), ln = wall_params(poly, i, j)
+    local = clamp(local, 0.0, ln)
+    # Сдвиг внутрь на свой радиус: ромб касается грани и виден целиком, а не
+    # половиной, утопленной в чёрной стене.
+    cx, cy = ax + ux * local + dx * CAM_DOT_DW, ay + uy * local + dy * CAM_DOT_DW
+
+    out = img.convert("RGB")
+    if style != "dot":
+        xs = [p[0] for p in poly]
+        ys = [p[1] for p in poly]
+        # Радиус заведомо больше комнаты: лишнее срежет маска пола, зато сектор
+        # гарантированно дотягивается до дальней стены при любой форме.
+        reach = math.hypot(max(xs) - min(xs), max(ys) - min(ys))
+        px, py = P(cx, cy)
+        r = reach * s * SS
+        view = math.degrees(math.atan2(dy, dx))
+        a0, a1 = view - CAM_FOV_DEG / 2, view + CAM_FOV_DEG / 2
+        if a0 < 0:      # pieslice ждёт неотрицательные углы по часовой стрелке
+            a0, a1 = a0 + 360, a1 + 360
+        sector = Image.new("L", img.size, 0)
+        ImageDraw.Draw(sector).pieslice(
+            [px - r, py - r, px + r, py + r], start=a0, end=a1, fill=CAM_SECTOR_ALPHA
+        )
+        floor_only = img.point(lambda v: 255 if v == FLOOR else 0)
+        out.paste(CAM_SECTOR_RGB, mask=ImageChops.multiply(sector, floor_only))
+
+    r = CAM_DOT_DW
+    ImageDraw.Draw(out).polygon(
+        [P(cx, cy - r), P(cx + r, cy), P(cx, cy + r), P(cx - r, cy)], fill=(INK, INK, INK)
+    )
+    return out
 
 
 def _draw_furniture(dr, P, s, f: dict) -> None:

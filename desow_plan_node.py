@@ -7,9 +7,9 @@ import torch
 from PIL import Image
 
 try:
-    from .desow_plan import blank_png, build_empty_plan
+    from .desow_plan import blank_png, build_empty_plan, render_camera_png
 except ImportError:  # импорт модуля вне пакета (тесты, ручная проверка)
-    from desow_plan import blank_png, build_empty_plan
+    from desow_plan import blank_png, build_empty_plan, render_camera_png
 
 
 def _png_to_tensor(png_bytes):
@@ -28,6 +28,11 @@ class DesowPlanRender:
 
     Ошибка данных НЕ роняет воркфлоу: на выходе белый лист, пустой `plan_json` и
     причина в `debug`. Скан обязан завершаться даже при сбое плана.
+
+    Выходов четыре. `image` — чистый трёхтоновый план, на нём бэкенд расставляет
+    мебель. `plan_camera` — тот же план с маркером точки съёмки (якорь ракурса для
+    картиночной модели); отдельным выходом, а не флагом, потому что нужны оба
+    одновременно и в одном прогоне.
     """
 
     @classmethod
@@ -46,8 +51,10 @@ class DesowPlanRender:
             },
         }
 
-    RETURN_TYPES = ("IMAGE", "STRING", "STRING")
-    RETURN_NAMES = ("image", "plan_json", "debug")
+    # Порядок выходов — часть контракта графов: связи в JSON воркфлоу позиционные,
+    # поэтому новый выход дописывается СТРОГО в конец.
+    RETURN_TYPES = ("IMAGE", "STRING", "STRING", "IMAGE")
+    RETURN_NAMES = ("image", "plan_json", "debug", "plan_camera")
 
     FUNCTION = "render"
     CATEGORY = "Desow/Plan"
@@ -62,7 +69,7 @@ class DesowPlanRender:
             # но уронить прогон из-за плана нельзя ни при каких данных.
             png, plan_json = blank_png(), ""
             debug = "plan: ОШИБКА unexpected: %s: %s" % (exc.__class__.__name__, exc)
-        return (_png_to_tensor(png), plan_json, debug)
+        return (_png_to_tensor(png), plan_json, debug, _png_to_tensor(render_camera_png(plan_json)))
 
 
 NODE_CLASS_MAPPINGS = {
