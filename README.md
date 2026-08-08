@@ -11,8 +11,12 @@ A custom node for ComfyUI that allows you to interact with OpenRouter's API, pro
 | `LayoutJsonValidator` | `layout_json_validator.py` + `_node.py` | чинит и валидирует layout-JSON от VLM |
 | `DesowIsBlank` | `is_blank.py` + `is_blank_node.py` | проверка «на входе ничего нет» (0 и False — НЕ пусто) |
 | `DesowPlanRender` | `desow_plan/` + `desow_plan_node.py` | строит пустой 2D-план комнаты кодом |
+| `DesowPlanFurnish` | `desow_plan/` + `desow_plan_furnish_node.py` | расставляет мебель на готовом плане (LLM + валидатор эргономики) |
 
 Ключи попадают в JSON воркфлоу — переименование ломает все графы, где нода стоит.
+
+Сеть у всех нод одна: `openrouter_api.py` (ключ из `OPENROUTER_API_KEY`, политика
+ретраев, таймаут). Своего http-стека нода заводить не должна.
 
 ### `DesowPlanRender`: вендоренный код и двойное ведение
 
@@ -26,6 +30,8 @@ A custom node for ComfyUI that allows you to interact with OpenRouter's API, pro
 | `desow_plan/merge.py` | `plan2d/merge.py` (различие: строка импорта) |
 | `desow_plan/gate.py` | `plan2d/gate.py` (различие: строка импорта) |
 | `desow_plan/render.py` | `plan2d/render.py` (различие: строка импорта) |
+| `desow_plan/validate.py` | `plan2d/validate.py` (различие: строка импорта) — эргономика расстановки |
+| `desow_plan/furnish.py` | `plan2d/furnish.py` (промпт и цикл ре-промптов; отличия в шапке файла) |
 | `desow_plan/schema_lite.py` | `plan2d/schema.py` (переписан без pydantic, см. докстринг) |
 | `desow_plan/scanner.py` | `layout_openings_match.parse_scan_openings` + `plan2d/extract.extract_json_object` |
 
@@ -53,6 +59,37 @@ A custom node for ComfyUI that allows you to interact with OpenRouter's API, pro
 Сама камера живёт в плане ДАННЫМИ — блок `camera` в `plan_json`
 (`{"wall","position","direction","marker"}`, пока константа «центр front-стены»).
 Рисует её только `render.render_plan(..., draw_camera=True)`; бэкенд её не рисует.
+
+### `DesowPlanFurnish`: расстановка мебели
+
+Фаза B того же эпика: план из скана + тип комнаты -> мебель на плане. Порядок —
+LLM предлагает координаты -> **валидатор кодом** (containment, дуга и подход
+двери, полоса перед окном, проходы, простенки) -> список нарушений уезжает
+модели ре-промптом -> рендер. Судья расстановки код, а не вторая модель:
+нарушения объяснимы и воспроизводимы.
+
+| Вход | Тип | Смысл |
+|---|---|---|
+| `plan_json` | STRING, сокет | канонический план (выход `plan_json` DesowPlanRender) |
+| `room_type` | виджет | «bedroom», «living room», ... |
+| `model` | виджет | текстовая модель OpenRouter (дефолт `google/gemini-3.6-flash`) |
+| `max_attempts` | виджет 1..5 | число ВЫЗОВОВ модели: 1 — без ре-промптов |
+| `draw_camera` | виджет | маркер точки съёмки поверх плана с мебелью |
+| `seed` | виджет | вариативность расстановки и обход кеша ComfyUI |
+| `fail_soft` | виджет | мягкий отказ вместо исключения |
+| `style_hint` | STRING, сокет, необязателен | краткие пожелания стиля (состав мебели, не геометрия) |
+
+Выходы: `furnished_plan` (IMAGE), `furniture_json` (массив предметов), `debug`
+(попытки, нарушения по итерациям, исход). Порядок — часть контракта графов.
+
+`fail_soft=True` (дефолт): терминальный сбой (модель недоступна после ретраев,
+ни одной разобранной расстановки, битый план) даёт **белый лист**, пустой
+`furniture_json` и причину `PLACEMENT_FAILED: ...` в `debug` — гейт `DesowIsBlank`
+ниже по графу уводит генерацию в ветку «без плана», а прогон не падает.
+`fail_soft=False` — исключение, для отладки.
+
+Оставшиеся после лимита попыток нарушения результат не отменяют (планка
+«правдоподобно, не идеально») — они видны в `debug`.
 
 ### Тесты
 

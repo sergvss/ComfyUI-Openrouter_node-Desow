@@ -7,9 +7,13 @@
 1. **Нет pydantic.** На машинах ComfyUI он не гарантирован, а тянуть зависимость
    ради одной ноды нельзя. Правила выражены функциями на голых dict; сами
    правила (границы, конечность чисел, обязательность полей) — построчный порт.
-2. **Нет FurnitureItem.** Нода строит только ПУСТОЙ план: мебель расставляет
-   бэкенд (`docs/design/SCAN_PLAN_INTEGRATION.md`). Ключ `furniture` во входе
-   игнорируется.
+2. **`FurnitureItem` — функцией, а не моделью.** Расстановка мебели переехала с
+   бэкенда в ноду `DesowPlanFurnish`, поэтому проверка предмета нужна и здесь:
+   `validate_furniture_item` — построчный порт `FurnitureItem` (снап поворота к
+   0/90/180/270, конечные числа, размер в разумных метрах). Отличие от источника
+   только в способе сигнализации: `PlanDataError` вместо `ValidationError`.
+   `validate_plan` по-прежнему игнорирует ключ `furniture` во входе — план
+   строится пустым, мебель кладётся поверх отдельным шагом.
 3. **Частично битый вход не роняет план.** У бэкенда pydantic отвергает ответ
    целиком (там есть второй прогон VLM и fail-loud до списания кредитов). У ноды
    ретрая нет, а уронить скан она не имеет права, поэтому:
@@ -56,6 +60,21 @@ DEFAULT_WIDTH_DW = {"door": 1.0, "window": 1.6, "passage": 1.0}
 
 # Длина стены прямоугольной комнаты по имени стены.
 WALL_LEN_KEYS = {"back": "width_dw", "front": "width_dw", "left": "depth_dw", "right": "depth_dw"}
+
+# Ролевые группы мебели для эргономических правил (см. validate.validate_furniture).
+TALL_KINDS = frozenset({"wardrobe", "fridge", "kitchen_run"})
+OPENING_FRONT_KINDS = frozenset({"wardrobe", "fridge", "dresser"})
+
+# Нормы эргономики (метры). Значения — те же, что у бэкенда: по ним считает
+# validate.py и о них же написано в системном промпте расстановки.
+WINDOW_STRIP_M = 0.5       # свободная полоса перед окном
+DOOR_APPROACH_M = 0.7      # подход к двери за дугой
+DOOR_FRAME_CLEAR_M = 0.4   # зазор открывающейся техники от коробки двери
+PASSAGE_CLEAR_M = 0.7      # проход у свободного конца простенка
+
+# Предельный след одного предмета мебели. 10 м — заведомо больше любого реального
+# (самый крупный глиф словаря — kitchen_run ~4 м); всё, что больше, — галлюцинация.
+MAX_FURNITURE_SIZE_M = 10.0
 
 # Минимальный простенок: от угла комнаты до косяка и между соседними проёмами.
 # Та же норма 0.2 м, по которой гейт ставит дверь у угла. Нужна не только для
@@ -334,6 +353,50 @@ def validate_partitions(raw, notes):
             continue
         out.append(partition)
     return out
+
+
+# ── Мебель ───────────────────────────────────────────────────────────
+
+def _pair(raw, name):
+    """Пара чисел `[a, b]` (порт `tuple[float, float]` из источника)."""
+    if not isinstance(raw, (list, tuple)) or len(raw) != 2:
+        raise PlanDataError("%s: ожидалась пара [a, b], получено %r" % (name, raw))
+    return _number(raw[0], "%s[0]" % name), _number(raw[1], "%s[1]" % name)
+
+
+def validate_furniture_item(raw):
+    """Предмет мебели -> канонический dict. Порт `schema.FurnitureItem`.
+
+    Raises:
+        PlanDataError: предмет непригоден (вызывающий его выбрасывает, остальные
+        предметы расстановки при этом остаются — см. `furnish.parse_furniture`).
+    """
+    if not isinstance(raw, dict):
+        raise PlanDataError("furniture: ожидался объект, получено %s" % type(raw).__name__)
+    kind = raw.get("kind")
+    if not isinstance(kind, str) or not kind.strip():
+        raise PlanDataError("furniture.kind: ожидалась непустая строка, получено %r" % (kind,))
+    kind = kind.strip()
+
+    center = _pair(raw.get("center_dw"), "%s.center_dw" % kind)
+    size = _pair(raw.get("size_m"), "%s.size_m" % kind)
+    # Конечность чисел проверил _number: pydantic в источнике принимает nan/inf
+    # как float, поэтому там она вынесена в отдельный валидатор, здесь входит
+    # в примитив. Итог тот же: NaN до рендера не доезжает и не роняет Pillow.
+    for side in size:
+        if not 0 < side <= MAX_FURNITURE_SIZE_M:
+            raise PlanDataError(
+                "%s: size_m %g вне диапазона (0, %g] м" % (kind, side, MAX_FURNITURE_SIZE_M)
+            )
+
+    # Модель иногда шлёт 45 / 360 / -90. Рендер и валидатор различают только
+    # 0/90/180/270, поэтому приводим к ближайшему из них, а не браковываем
+    # весь ответ из-за одного предмета.
+    rotation = _number(raw.get("rotation", 0), "%s.rotation" % kind)
+    rotation = int(round(rotation / 90.0)) * 90 % 360
+
+    return {"kind": kind, "center_dw": [center[0], center[1]],
+            "size_m": [size[0], size[1]], "rotation": rotation}
 
 
 # ── Корень ───────────────────────────────────────────────────────────

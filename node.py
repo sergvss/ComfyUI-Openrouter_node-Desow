@@ -1,5 +1,3 @@
-import os
-import random
 import requests
 import json
 import time
@@ -12,14 +10,15 @@ import tiktoken
 from PIL import Image
 import hashlib # Added for hashing PDF bytes in IS_CHANGED
 from .chat_manager import ChatSessionManager
-
-
-# API key больше не хранится в widgets_values JSON — это вызывало утечки секрета
-# при экспорте воркфлоу (инцидент 2026-05-10). Теперь читается из переменной
-# окружения OPENROUTER_API_KEY. На ComfyDeploy задаётся через их Secrets-панель,
-# локально — через .env / launcher-скрипт.
-def _get_openrouter_api_key() -> str:
-    return os.environ.get("OPENROUTER_API_KEY", "").strip()
+# Ключ, предикат временной ошибки и backoff переехали в общий сетевой слой:
+# им пользуются и служебные ноды (DesowPlanFurnish). Имена оставлены прежними —
+# на них ссылается остальной код модуля.
+from .openrouter_api import (  # noqa: F401  (реэкспорт для остального модуля)
+    RETRYABLE_PROVIDER_ERROR_TYPES,
+    _get_openrouter_api_key,
+    _is_retryable_status,
+    _retry_sleep,
+)
 
 
 def _looks_like_stale_api_key(value) -> bool:
@@ -33,21 +32,6 @@ def _looks_like_stale_api_key(value) -> bool:
     probe = value.strip() if isinstance(value, str) else ""
     return probe.startswith("sk-or-") or "OPENROUTER_API_KEY" in probe.upper()
 
-
-# Retry с экспоненциальным backoff для retry-able ошибок API.
-# 429 (rate limit), 5xx (server errors), timeout, connection errors —
-# временные сбои, шансы успеха при повторе высокие. Safety reject и
-# другие 4xx — не retry, Gemini не передумает на тот же промпт.
-def _is_retryable_status(status_code: int) -> bool:
-    return status_code == 429 or status_code >= 500
-
-
-def _retry_sleep(attempt: int, base_delay: float = 1.0) -> None:
-    """Exponential backoff с jitter: 1s, 2s, 4s + random 0-1s.
-    Jitter нужен чтобы N параллельных клиентов не retry'ли одновременно после
-    общего 429 (это снова даст 429)."""
-    wait = base_delay * (2 ** attempt) + random.uniform(0, 1)
-    time.sleep(wait)
 
 # Define a placeholder type name for PDF data.
 # The actual input connection will accept '*' but we check the structure.
@@ -714,7 +698,7 @@ class OpenRouterNode:
         start_time = None
         end_time = None
         last_error = None
-        retryable_provider_error_types = {"rate_limit_exceeded", "timeout", "server_error", "internal_server_error"}
+        retryable_provider_error_types = RETRYABLE_PROVIDER_ERROR_TYPES
 
         for attempt in range(max_retries + 1):
             try:

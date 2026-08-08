@@ -5,10 +5,22 @@
 осознанное — в шапке каждого модуля указан источник, при правках менять парой.
 См. README репозитория, раздел «Ноды Desow».
 
-Зависимости: только Pillow (есть в любой сборке ComfyUI). Сети здесь нет —
-экстракцию делает OpenRouter-нода графа.
+Зависимости: только Pillow (есть в любой сборке ComfyUI). Сети здесь нет:
+экстракцию структуры делает OpenRouter-нода графа, а расстановка мебели
+(`build_furnished_plan`) получает вызов модели callable'ом снаружи — http-стек
+живёт в `openrouter_api.py`.
 """
-from .pipeline import blank_png, build_empty_plan, render_camera_png
+from .furnish import PLAN_FURNISH_MODEL, FurnishError
+from .pipeline import FurnishFailed, blank_png, build_empty_plan, build_furnished_plan, render_camera_png
 from .schema_lite import PlanDataError
 
-__all__ = ["build_empty_plan", "blank_png", "render_camera_png", "PlanDataError"]
+__all__ = [
+    "build_empty_plan",
+    "build_furnished_plan",
+    "blank_png",
+    "render_camera_png",
+    "FurnishError",
+    "FurnishFailed",
+    "PLAN_FURNISH_MODEL",
+    "PlanDataError",
+]

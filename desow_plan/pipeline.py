@@ -18,6 +18,7 @@ import json
 
 from PIL import Image
 
+from .furnish import STYLE_HINT_LIMIT, FurnishError, place_furniture
 from .gate import ensure_door_and_window, resolve_opening_conflicts
 from .merge import merge_with_scanner, scanner_openings_from_scan
 from .render import CANVAS, PAGE, render_plan
@@ -49,6 +50,19 @@ def render_camera_png(plan_json):
     except Exception:
         return blank_png()
     return png
+
+
+class FurnishFailed(RuntimeError):
+    """Расстановку построить не удалось (терминально).
+
+    Несёт накопленный до сбоя `debug`: обёртка ноды при `fail_soft=True` отдаёт
+    его вместе с белым листом, иначе исключение летит наружу и роняет прогон.
+    """
+
+    def __init__(self, reason, debug_lines=()):
+        self.reason = reason
+        self.debug_lines = list(debug_lines)
+        super().__init__(reason)
 
 
 def _fmt_ops(openings):
@@ -142,3 +156,115 @@ def build_empty_plan(extraction_json, scanner_openings_json="", room_type=""):
     plan_json = json.dumps(plan, ensure_ascii=False, separators=(",", ":"))
     debug.insert(0, "plan: ok (%d символов JSON)" % len(plan_json))
     return png, plan_json, "\n".join(debug)
+
+
+# Сколько нарушений одной попытки печатать в debug. Полный список уезжает модели
+# ре-промптом; в отчёт нужен характер проблемы, а не простыня на сто строк.
+_MAX_VIOLATIONS_IN_DEBUG = 12
+
+
+def build_furnished_plan(
+    plan_json,
+    room_type,
+    complete,
+    *,
+    style_hint="",
+    max_attempts=3,
+    draw_camera=True,
+    seed=0,
+    model_label="",
+):
+    """`(png_bytes, furniture_json, debug)` — план с расставленной мебелью.
+
+    Порядок: разбор канонического плана -> расстановка LLM с валидатором
+    эргономики и ре-промптами -> рендер плана с мебелью (и с маркером камеры,
+    если `draw_camera`). `complete(messages) -> str` — один вызов модели.
+
+    `max_attempts` — это число ВЫЗОВОВ модели (1 = ни одного ре-промпта), тогда
+    как у `place_furniture` (порт бэкенда) счёт идёт по ре-промптам. Пересчёт
+    здесь, чтобы вендоренный модуль остался построчной копией источника.
+
+    `furniture_json` — массив предметов, а не план целиком: план у потребителя
+    уже есть отдельным входом, дублировать его в втором выходе незачем.
+
+    Raises:
+        FurnishFailed: терминальный сбой (битый план, модель недоступна, ни одной
+        разобранной расстановки, рендер упал). Мягкую отдачу белого листа делает
+        обёртка ноды — здесь решение не принимается.
+    """
+    debug = []
+
+    # 1) Канонический план: вход ноды — выход DesowPlanRender, но приходить он
+    # может и из хранилища/руками, поэтому проверяется той же схемой.
+    try:
+        raw = extract_json_object(plan_json)
+    except (ValueError, TypeError) as exc:
+        debug.append("plan_raw: %r" % ((plan_json or "")[:200],))
+        raise FurnishFailed("plan_invalid_json: %s" % exc, debug) from exc
+    try:
+        plan, plan_notes = validate_plan(raw)
+    except PlanDataError as exc:
+        raise FurnishFailed("plan_invalid_schema: %s" % exc, debug) from exc
+
+    room = plan["room"]
+    debug.append(
+        "plan: комната %s %.2fx%.2f dw (%.2fx%.2f м), проёмов %d %s, простенков %d"
+        % (room["shape"], room["width_dw"], room["depth_dw"],
+           room["width_dw"] * DW_M, room["depth_dw"] * DW_M,
+           len(plan["openings"]), _fmt_ops(plan["openings"]), len(plan.get("partitions", [])))
+    )
+    for note in plan_notes:
+        debug.append("plan_fix: %s" % note)
+
+    hint = (style_hint or "").strip()
+    if len(hint) > STYLE_HINT_LIMIT:
+        debug.append("style_hint: обрезан %d -> %d символов" % (len(hint), STYLE_HINT_LIMIT))
+    attempts = max(1, int(max_attempts))
+    debug.append(
+        "furnish_in: model=%s, room_type=%r, попыток<=%d, seed=%d, style_hint=%s, draw_camera=%s"
+        % (model_label or "?", room_type or "", attempts, int(seed),
+           ("%d символов" % len(hint)) if hint else "нет", draw_camera)
+    )
+
+    # 2) Расстановка: LLM -> валидатор эргономики -> ре-промпт нарушений.
+    try:
+        furniture, meta = place_furniture(
+            complete, plan, room_type or "",
+            max_retries=attempts - 1, style_hint=hint, seed=seed,
+        )
+    except FurnishError as exc:
+        raise FurnishFailed("%s: %s" % (exc.code, exc), debug) from exc
+    except Exception as exc:
+        # Сюда попадает всё сетевое: `complete` — это уже исчерпавший ретраи
+        # вызов OpenRouter. Отдельной ветки на класс ошибки нет намеренно:
+        # для графа любая из них означает одно — расстановки не будет.
+        raise FurnishFailed("llm_unavailable: %s: %s" % (exc.__class__.__name__, str(exc)[:200]), debug) from exc
+
+    for i, errs in enumerate(meta["violations_by_attempt"], 1):
+        debug.append("attempt %d: нарушений %d" % (i, len(errs)))
+        for err in errs[:_MAX_VIOLATIONS_IN_DEBUG]:
+            debug.append("  violation: %s" % err)
+        if len(errs) > _MAX_VIOLATIONS_IN_DEBUG:
+            debug.append("  ... ещё %d" % (len(errs) - _MAX_VIOLATIONS_IN_DEBUG))
+    debug.append(
+        "furnish: предметов %d, вызовов модели %d, ре-промптов %d, нарушений осталось %d"
+        % (len(furniture), meta["calls"], meta["retries"], len(meta["violations"]))
+    )
+    debug.append("furniture: [%s]" % ", ".join(f["kind"] for f in furniture))
+
+    # 3) Рендер плана с мебелью. Геометрия предметов уже проверена схемой, но
+    # уронить прогон рендер всё равно не имеет права.
+    try:
+        png, render_meta = render_plan(
+            dict(plan, furniture=furniture), with_furniture=True, draw_camera=draw_camera
+        )
+    except (ValueError, KeyError, ZeroDivisionError, OverflowError) as exc:
+        raise FurnishFailed("render_failed: %s: %s" % (exc.__class__.__name__, exc), debug) from exc
+    debug.append("render: %s" % json.dumps(render_meta, ensure_ascii=False))
+    debug.append(
+        "camera: %s" % (json.dumps(plan["camera"], ensure_ascii=False) if draw_camera else "не рисуется")
+    )
+
+    furniture_json = json.dumps(furniture, ensure_ascii=False, separators=(",", ":"))
+    debug.insert(0, "furnish: ok (%d предметов, %d символов JSON)" % (len(furniture), len(furniture_json)))
+    return png, furniture_json, "\n".join(debug)
