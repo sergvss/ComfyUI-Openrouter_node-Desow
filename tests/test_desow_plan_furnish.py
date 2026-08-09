@@ -221,6 +221,61 @@ def test_furniture_side_by_side_is_legal_but_overlap_is_not():
     assert any("пересечение" in e for e in validate_furniture(TOL_ROOM, [left, over]))
 
 
+# ── зоны широкой (двустворчатой) двери ───────────────────────────────
+
+# Боевой кадр kitchen: садовая остеклённая дверь 1.6 dw (1.36 м) на правой стене.
+WIDE_DOOR_ROOM = {
+    "room": {"shape": "rectangle", "width_dw": 6.0, "depth_dw": 5.0},
+    "openings": [
+        {"type": "balcony_door", "wall": "right", "offset_dw": 3.8, "width_dw": 1.6,
+         "swing": {"hinge": "back", "direction": "in"}},
+    ],
+}
+# Та же дверь на back-стене: проверяем дугу дальней от петель створки.
+WIDE_DOOR_BACK = {
+    "room": {"shape": "rectangle", "width_dw": 6.0, "depth_dw": 5.0},
+    "openings": [
+        {"type": "balcony_door", "wall": "back", "offset_dw": 3.0, "width_dw": 1.6,
+         "swing": {"hinge": "left", "direction": "in"}},
+    ],
+}
+
+
+def test_wide_door_zones_are_measured_by_the_leaf():
+    """Зоны широкой двери считаются по створке, как её и рисует рендер.
+
+    Створка вдвое короче проёма, поэтому подход к двери 1.6 dw кончается в
+    0.8 + 0.7 м от стены. Комод в 1.65 dw от неё стоит свободно — при расчёте
+    по полной ширине проёма он попадал бы в зону и съедал ре-промпт.
+    """
+    far = {"kind": "dresser", "center_dw": [4.0, 3.8], "size_m": [0.6, 0.6], "rotation": 0}
+    assert validate_furniture(WIDE_DOOR_ROOM, [far]) == []
+    near = {"kind": "dresser", "center_dw": [5.5, 3.8], "size_m": [0.6, 0.6], "rotation": 0}
+    errs = validate_furniture(WIDE_DOOR_ROOM, [near])
+    assert any("подход к двери" in e for e in errs), errs
+    assert any("дугу двери" in e and "< 0.80 dw" in e for e in errs), errs
+
+
+def test_both_leaves_of_a_wide_door_sweep_their_arc():
+    """У двустворчатой двери две дуги: дальняя от петель тоже держит место.
+
+    С одной дугой на весь проём место у дальнего края не резервировалось вовсе —
+    предмет вставал вплотную к створке, которая туда открывается.
+    """
+    at_far_edge = {"kind": "side_table", "center_dw": [4.3, 0.3], "size_m": [0.3, 0.3],
+                   "rotation": 0}
+    assert any("дугу двери" in e for e in validate_furniture(WIDE_DOOR_BACK, [at_far_edge]))
+    beyond = {"kind": "side_table", "center_dw": [5.0, 0.3], "size_m": [0.3, 0.3], "rotation": 0}
+    assert validate_furniture(WIDE_DOOR_BACK, [beyond]) == []
+
+
+def test_narrow_door_zones_are_unchanged():
+    """Обычная дверь 1.0 dw одностворчатая: дуга во всю ширину, подход прежний."""
+    errs = validate_furniture(PLAN, BAD_FURNITURE)
+    assert any("дугу двери" in e and "< 1.00 dw" in e for e in errs), errs
+    assert any("подход к двери" in e for e in errs), errs
+
+
 # ── цикл расстановки ─────────────────────────────────────────────────
 
 def test_single_call_when_layout_is_clean():

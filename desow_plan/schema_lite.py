@@ -46,6 +46,33 @@ WINDOW_TYPES = frozenset({"window", "floor_to_ceiling_window"})
 ENTRANCE_TYPES = frozenset({"door", "double_door", "passage"})
 OPENING_TYPES = frozenset(DOOR_TYPES | WINDOW_TYPES | {"passage"})
 
+# Сколько у двери створок, решает ШИРИНА проёма, а не его тип. Одностворчатых
+# полотен шире 1.0-1.1 м не делают: ряд ГОСТ 6629 для межкомнатных — 0.6-0.9 м,
+# входные по ГОСТ 31173 доходят до 1.1 м, дальше полотно тяжелеет, провисает на
+# петлях и требует непомерного радиуса открывания. Всё, что шире, собирают из
+# двух створок — в том числе садовые и балконные остеклённые блоки. Порог 1.2 м
+# взят с запасом над верхней границей однопольного полотна: обычная дверь
+# 1.0-1.1 м остаётся одностворчатой, а проём заведомо шире реального полотна
+# рисуется и проверяется как двустворчатый.
+DOUBLE_LEAF_THRESHOLD_M = 1.2
+DOUBLE_LEAF_THRESHOLD_DW = DOUBLE_LEAF_THRESHOLD_M / DW_M   # ≈ 1.41 dw
+
+
+def is_double_leaf(opening) -> bool:
+    """Дверь рисуется и проверяется как двустворчатая? (только для DOOR_TYPES)
+
+    Один предикат на рендер и валидатор: разойдись они — на чертеже была бы одна
+    геометрия открывания, а нарушения расстановки считались бы по другой. Тип
+    `double_door` форсирует две створки при любой ширине (экстрактор назвал дверь
+    так, глядя на фото), остальным число створок задаёт ширина проёма.
+    """
+    if opening.get("type") == "double_door":
+        return True
+    try:
+        return float(opening.get("width_dw", 0)) > DOUBLE_LEAF_THRESHOLD_DW
+    except (TypeError, ValueError):
+        return False
+
 WALL_NAMES = frozenset({"back", "front", "left", "right"})
 SHAPES = frozenset({"rectangle", "l_shape"})
 ATTACH_NAMES = frozenset({"back", "front", "left", "right", "free"})

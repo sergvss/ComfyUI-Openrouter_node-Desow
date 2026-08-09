@@ -7,7 +7,8 @@
 - холст 1152x928, лист белый (255), пол светло-серый (237), стены сплошной чёрный (0);
 - толщина стены = 1/4 ширины двери (эталон: проём 148 px, стена 37 px);
 - дверь: разрыв в стене + полотно (тонкий белый прямоугольник с контуром) + четвертьдуга
-  (одинаково для `door` и `balcony_door` — они различаются смыслом, а не символом);
+  (символ один на все `DOOR_TYPES` — они различаются смыслом, а не нотацией); проём
+  шире `DOUBLE_LEAF_THRESHOLD_M` — две створки от краёв к центру и две дуги навстречу;
 - окно: разрыв + линии по граням стены + двойной штрих + торцевые перемычки;
 - проход (passage): чистый разрыв в цвет пола;
 - мебель: белая заливка, тонкий чёрный контур, без текста;
@@ -33,7 +34,7 @@ from .geometry import (
     wall_params,
     wall_span,
 )
-from .schema_lite import DOOR_TYPES, DW_M, WALL_T_DW
+from .schema_lite import DOOR_TYPES, DW_M, WALL_T_DW, is_double_leaf
 
 # --- константы графстандарта (в финальных пикселях) ---
 CANVAS = (1152, 928)
@@ -104,7 +105,7 @@ def render_plan(
             wall = op.get("wall")
             if wall in ext:
                 r = float(op.get("width_dw", 1.0))
-                if op["type"] == "double_door":
+                if is_double_leaf(op):   # створка вдвое уже проёма — и дуга тоже
                     r = r / 2
                 ext[wall] = max(ext[wall], max(0.0, r - t_dw))
     box_w = CANVAS[0] - MARGIN["left"] - MARGIN["right"]
@@ -244,11 +245,11 @@ def render_plan(
                     start, end = a1, a0
                 dr.arc(bbox, start=start, end=end, fill=INK, width=max(1, thin // 2))
 
-            if op["type"] != "double_door":   # одностворчатая: door и balcony_door
+            if not is_double_leaf(op):   # одна створка на всю ширину проёма
                 hp = c0 if hinge_at_c0 else c1
                 other = c1 if hinge_at_c0 else c0
                 draw_leaf_arc(hp, other, half * 2)
-            else:   # double_door: две створки, дуги встречаются в центре
+            else:   # две створки от краёв, дуги встречаются в центре
                 mid = ((c0[0] + c1[0]) / 2, (c0[1] + c1[1]) / 2)
                 draw_leaf_arc(c0, mid, half)
                 draw_leaf_arc(c1, mid, half)

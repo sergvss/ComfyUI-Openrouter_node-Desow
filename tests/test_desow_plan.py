@@ -18,6 +18,7 @@ from desow_plan.schema_lite import (
     DEFAULT_CAMERA,
     MIN_CORNER_CLEARANCE_DW,
     PlanDataError,
+    is_double_leaf,
     validate_plan,
 )
 
@@ -161,6 +162,24 @@ def test_balcony_door_is_a_first_class_opening_type():
     opening = plan["openings"][0]
     assert opening["type"] == "balcony_door"
     assert opening["swing"] == {"hinge": "right", "direction": "in"}
+
+
+@pytest.mark.parametrize("kind, width_dw, double", [
+    ("door", 1.0, False),           # 0.85 м — рядовое межкомнатное полотно
+    ("door", 1.29, False),          # 1.10 м — предел однопольного полотна по ГОСТ
+    ("door", 1.42, True),           # 1.21 м — за порогом, полотна такой ширины нет
+    ("balcony_door", 0.9, False),   # 0.77 м — балконная створка обычного размера
+    ("balcony_door", 1.6, True),    # 1.36 м — садовая дверь боевого кадра kitchen
+    ("double_door", 0.9, True),     # тип форсирует две створки при любой ширине
+])
+def test_double_leaf_is_decided_by_width_not_by_type(kind, width_dw, double):
+    """Число створок — свойство ширины проёма, а не его подтипа.
+
+    Общий предикат для рендера и валидатора: одностворчатых полотен шире
+    1.0-1.1 м не бывает, поэтому широкий проём любого дверного типа собирается
+    из двух створок.
+    """
+    assert is_double_leaf({"type": kind, "width_dw": width_dw}) is double
 
 
 def test_wall_index_is_allowed_for_l_shape():
@@ -689,6 +708,56 @@ def test_balcony_door_is_drawn_with_the_door_symbol():
     assert render_plan(balcony, with_furniture=False)[0] != render_plan(blank, with_furniture=False)[0]
     # Балконная дверь — тоже дверное полотно, то есть годная линейка масштаба.
     assert render_plan(balcony, with_furniture=False)[1]["scale_fallback"] is False
+
+
+def door_sheet(kind, width_dw, *, offset_dw=2.0, hinge="left"):
+    """Лист с единственной дверью на back-стене (комната 4.0 dw шириной)."""
+    return render_plan(plan_with(openings=[
+        {"type": kind, "wall": "back", "offset_dw": offset_dw, "width_dw": width_dw,
+         "swing": {"hinge": hinge, "direction": "in"}}]), with_furniture=False)[0]
+
+
+def mirrored_diff_box(png):
+    """bbox расхождения листа со своим зеркалом; None — лист симметричен.
+
+    Комната, стены и пол симметричны относительно вертикальной оси, поэтому
+    асимметрию даёт только символ двери: две створки навстречу симметричны,
+    одна на всю ширину проёма — нет.
+    """
+    with Image.open(io.BytesIO(png)) as image:
+        grey = image.convert("L")
+        return ImageChops.difference(grey, grey.transpose(Image.FLIP_LEFT_RIGHT)).getbbox()
+
+
+@pytest.mark.parametrize("kind, width_dw", [("balcony_door", 1.8), ("door", 1.6)])
+def test_wide_door_is_drawn_with_two_leaves(kind, width_dw):
+    """Проём шире порога рисуется двустворчатым независимо от подтипа двери.
+
+    Эталон двустворчатости — `double_door` той же ширины: символ обязан совпасть
+    с ним побайтно, иначе на чертеже окажется одна створка в 1.4-1.5 м, каких не
+    бывает, и дуга радиусом во всю ширину проёма.
+    """
+    assert door_sheet(kind, width_dw) == door_sheet("double_door", width_dw)
+
+
+@pytest.mark.parametrize("kind, width_dw", [("balcony_door", 0.9), ("door", 1.0)])
+def test_narrow_door_keeps_one_leaf(kind, width_dw):
+    """Дверь обычной ширины остаётся одностворчатой (регресс кадра fin424).
+
+    Тот же лист у `double_door` этой ширины другой: тип форсирует две створки
+    там, где ширина их не требует.
+    """
+    assert door_sheet(kind, width_dw) != door_sheet("double_door", width_dw)
+
+
+def test_two_leaves_meet_in_the_middle_of_the_opening():
+    """Пиксельно: у широкой двери две дуги навстречу, у обычной — одна.
+
+    Дверь стоит по центру стены, так что двустворчатый символ делает лист
+    зеркально симметричным, а одностворчатый — нет.
+    """
+    assert mirrored_diff_box(door_sheet("balcony_door", 1.8)) is None
+    assert mirrored_diff_box(door_sheet("balcony_door", 0.9)) is not None
 
 
 def test_rendered_plan_is_not_blank():

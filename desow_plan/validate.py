@@ -37,6 +37,7 @@ from .schema_lite import (
     TALL_KINDS,
     WALL_LEN_KEYS,
     WINDOW_STRIP_M,
+    is_double_leaf,
 )
 
 PASSAGE_CLEAR_DW = PASSAGE_CLEAR_M / DW_M
@@ -213,7 +214,9 @@ def validate_furniture(room_data: dict, furniture: list) -> list[str]:
             if _rects_overlap((ax0, ay0, ax1, ay1), (bx0, by0, bx1, by1)):
                 errs.append(f"пересечение {k1} и {k2}")
 
-    # Дуга двери: петля — центр дуги, радиус = ширина проёма.
+    # Дуга двери: петля — центр дуги, радиус = ширина СТВОРКИ. Число створок даёт
+    # тот же предикат, что и рендеру (`is_double_leaf`): у двустворчатой их две,
+    # по одной от каждого края проёма, и каждая заметает полширины.
     for op in room_data.get("openings", []):
         if op["type"] not in DOOR_TYPES:
             continue
@@ -221,22 +224,29 @@ def validate_furniture(room_data: dict, furniture: list) -> list[str]:
         hinge = (op.get("swing") or {}).get("hinge", "back")
         wall = op["wall"]
         if wall == "left":
-            hp = (0.0, off - w / 2 if hinge == "back" else off + w / 2)
+            ends = ((0.0, off - w / 2), (0.0, off + w / 2))
         elif wall == "right":
-            hp = (W, off - w / 2 if hinge == "back" else off + w / 2)
+            ends = ((W, off - w / 2), (W, off + w / 2))
         elif wall == "back":
-            hp = (off - w / 2 if hinge == "left" else off + w / 2, 0.0)
+            ends = ((off - w / 2, 0.0), (off + w / 2, 0.0))
         else:
-            hp = (off - w / 2 if hinge == "left" else off + w / 2, D)
+            ends = ((off - w / 2, D), (off + w / 2, D))
+        if is_double_leaf(op):
+            leaf, hinges = w / 2, ends
+        else:   # петли у начала стены (back/left) или у её конца
+            at_start = hinge == "back" if wall in ("left", "right") else hinge == "left"
+            leaf, hinges = w, (ends[0] if at_start else ends[1],)
         for kind, x0, y0, x1, y1 in rects:
             if kind == "rug":
                 continue
-            qx = min(max(hp[0], x0), x1)
-            qy = min(max(hp[1], y0), y1)
-            dist = math.hypot(qx - hp[0], qy - hp[1])
-            if dist < w - 1e-6:
+            # Ближайшая из створок: одно нарушение на предмет, а не по створке.
+            dist = min(
+                math.hypot(min(max(hx, x0), x1) - hx, min(max(hy, y0), y1) - hy)
+                for hx, hy in hinges
+            )
+            if dist < leaf - 1e-6:
                 errs.append(
-                    f"{kind} перекрывает дугу двери на {wall} (расст {dist:.2f} < {w:.2f} dw)"
+                    f"{kind} перекрывает дугу двери на {wall} (расст {dist:.2f} < {leaf:.2f} dw)"
                 )
 
     # Полоса перед окном, подход к двери, зазор техники от коробки.
@@ -253,7 +263,10 @@ def validate_furniture(room_data: dict, furniture: list) -> list[str]:
                     )
         elif nt in DOOR_TYPES:
             w = float(op["width_dw"])
-            zone = _zone_from_span(c0, c1, n_in, w + DOOR_APPROACH_M / DW_M)
+            # Зона считается от дуги, а дугу заметает СТВОРКА: у двустворчатой
+            # двери полотно вдвое короче, и подход к ней не глубже, чем к обычной.
+            leaf = w / 2 if is_double_leaf(op) else w
+            zone = _zone_from_span(c0, c1, n_in, leaf + DOOR_APPROACH_M / DW_M)
             for kind, x0, y0, x1, y1 in rects:
                 if kind != "rug" and _rects_overlap(zone, (x0, y0, x1, y1)):
                     errs.append(
