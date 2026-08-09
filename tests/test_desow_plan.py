@@ -694,8 +694,52 @@ def test_camera_sector_is_the_only_colour_on_the_sheet():
     assert r > g > b, (r, g, b)          # персиково-оранжевый, а не любой цвет
 
 
+def marker_mask(plain, cam):
+    """Маска маркера: пиксели, где на чистом листе был пол, а стал чёрный.
+
+    Так знак отделяется от сектора без отдельного стиля «маркер без сектора»:
+    сектор пол КРАСИТ (персиковый ~180 по яркости), а чернит его только маркер.
+    """
+    with Image.open(io.BytesIO(plain)) as a, Image.open(io.BytesIO(cam)) as b:
+        floor = a.convert("L").point(lambda v: 255 if v > 200 else 0)
+        dark = b.convert("L").point(lambda v: 255 if v < 100 else 0)
+        return ImageChops.multiply(floor, dark)
+
+
+def row_span(mask, y):
+    """Ширина маркера в строке y (0 — строка пустая)."""
+    box = mask.crop((0, y, mask.width, y + 1)).getbbox()
+    return 0 if box is None else box[2] - box[0]
+
+
+def test_camera_icon_is_the_default_marker():
+    """Дефолтный знак — иконка камеры; ромб остался legacy-вариантом."""
+    plain, _ = render_plan(CAM_PLAN, with_furniture=False)
+    icon, _ = render_plan(CAM_PLAN, with_furniture=False, draw_camera=True)
+    legacy, _ = render_plan(CAM_PLAN, with_furniture=False, draw_camera=True, camera_style="sector")
+    assert icon != legacy
+    icon_px = marker_mask(plain, icon).histogram()[255]
+    legacy_px = marker_mask(plain, legacy).histogram()[255]
+    assert icon_px > legacy_px * 2, (icon_px, legacy_px)     # силуэт крупнее точки
+    assert chromatic(icon), "сектор рисуется и с иконкой"
+
+
+def test_camera_icon_lens_points_along_the_view_direction():
+    """Узкий объектив — со стороны взгляда, широкий корпус — со стороны стены."""
+    plain, _ = render_plan(CAM_PLAN, with_furniture=False)
+    icon, _ = render_plan(CAM_PLAN, with_furniture=False, draw_camera=True)
+    mask = marker_mask(plain, icon)
+    x0, y0, x1, y1 = mask.getbbox()
+    height = y1 - y0
+    lens = row_span(mask, y0 + height // 8)          # взгляд «вверх» -> объектив сверху
+    body = row_span(mask, y1 - height // 8)
+    assert 0 < lens < body * 0.6, (lens, body)
+    # Знак стоит у своей стены и внутрь комнаты глубоко не лезет.
+    assert y1 > CANVAS[1] * 0.75 and height < CANVAS[1] * 0.12, (y0, y1)
+
+
 def test_camera_dot_sits_at_the_front_wall_centre():
-    """Маркер точки съёмки — в нижней зоне листа, по центру front-стены."""
+    """Legacy-ромб: маркер в нижней зоне листа, по центру front-стены."""
     plain, _ = render_plan(CAM_PLAN, with_furniture=False)
     dot, _ = render_plan(CAM_PLAN, with_furniture=False, draw_camera=True, camera_style="dot")
     assert chromatic(dot) == []          # style="dot" — без сектора

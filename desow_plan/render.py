@@ -48,14 +48,28 @@ LEAF_T = 7      # толщина дверного полотна в px
 # --- маркер камеры (рисуется только в camera-версии листа) ---
 # Канон приёма «камера на плане» для Nano Banana: контрастная точка стояния плюс
 # явный указатель направления (docs/design/CAMERA_ON_PLAN_RESEARCH.md). У нас это
-# ромб + широкий сектор обзора; сектор полупрозрачный, чтобы мебель читалась сквозь него.
+# иконка камеры + широкий сектор обзора; сектор полупрозрачный, чтобы мебель
+# читалась сквозь него.
 CAM_SECTOR_RGB = (245, 165, 122)
 CAM_SECTOR_ALPHA = 90       # ~35%: заливка видна, но не спорит с чертежом
 CAM_FOV_DEG = 75.0          # раскрытие сектора обзора
-CAM_DOT_DW = 0.11           # полудиагональ ромба-маркера
+CAM_DOT_DW = 0.11           # полудиагональ ромба (legacy-маркер)
+# Иконка камеры: корпус со скруглением + выступающий объектив; ось объектива и есть
+# направление взгляда. Габарит 0.47 x 0.46 dw (~0.4 м) — вдвое крупнее прежнего
+# ромба: узнаваемость силуэта требует места, а на листе это по-прежнему мелкий знак.
+CAM_ICON_INSET_DW = 0.03    # зазор от внутренней грани стены до задней стенки корпуса
+CAM_ICON_BODY_DW = 0.30     # корпус вдоль взгляда
+CAM_ICON_WIDTH_DW = 0.46    # корпус поперёк взгляда
+CAM_ICON_BODY_R_DW = 0.07   # скругление корпуса
+CAM_ICON_LENS_DW = 0.14     # вылет объектива за корпус
+CAM_ICON_LENS_W_DW = 0.20   # ширина объектива
+CAM_ICON_LENS_R_DW = 0.04   # скругление объектива
 # Направление взгляда НА ЛИСТЕ (не в мире): y вниз, поэтому "up" — это -y.
 CAM_DIR_VEC = {"up": (0.0, -1.0), "down": (0.0, 1.0), "left": (-1.0, 0.0), "right": (1.0, 0.0)}
-CAMERA_STYLES = ("sector", "dot")   # "dot" — только точка, без сектора
+# "camera_icon" — иконка + сектор (дефолт); "sector" и "dot" — прежний ромб
+# с сектором и без него, оставлены для сравнения и старых вызовов.
+CAMERA_STYLES = ("camera_icon", "sector", "dot")
+DIAMOND_STYLES = ("sector", "dot")
 
 
 def render_plan(
@@ -63,7 +77,7 @@ def render_plan(
     *,
     with_furniture: bool = True,
     draw_camera: bool = False,
-    camera_style: str = "sector",
+    camera_style: str = "camera_icon",
 ) -> tuple[bytes, dict]:
     """Рисует план и возвращает (png_bytes, meta).
 
@@ -262,12 +276,12 @@ def render_plan(
     return buf.getvalue(), meta
 
 
-def _paint_camera(img, data: dict, poly: list, P, s: float, *, style: str = "sector"):
+def _paint_camera(img, data: dict, poly: list, P, s: float, *, style: str = "camera_icon"):
     """Накладывает маркер камеры на готовый лист и возвращает RGB-изображение.
 
     Сектор заливается ТОЛЬКО по чистому полу (маска «пиксель ровно цвета пола»):
     так он ложится ПОД мебель и под символы проёмов — те остаются нетронутыми и
-    читаются сквозь заливку, а не тонут в ней. Ромб точки рисуется последним:
+    читаются сквозь заливку, а не тонут в ней. Маркер рисуется последним:
     его не должен закрыть предмет, стоящий у стены.
 
     Работает по блоку `camera` плана; блока нет (план построен до его появления) —
@@ -288,9 +302,16 @@ def _paint_camera(img, data: dict, poly: list, P, s: float, *, style: str = "sec
     i, j, local = wall_edge(room, wall, poly, start + position * (end - start))
     (ax, ay), (ux, uy), ln = wall_params(poly, i, j)
     local = clamp(local, 0.0, ln)
-    # Сдвиг внутрь на свой радиус: ромб касается грани и виден целиком, а не
-    # половиной, утопленной в чёрной стене.
-    cx, cy = ax + ux * local + dx * CAM_DOT_DW, ay + uy * local + dy * CAM_DOT_DW
+    # Точка на внутренней грани стены, от неё маркер растёт внутрь комнаты.
+    base = (ax + ux * local, ay + uy * local)
+    diamond = style in DIAMOND_STYLES
+    # Апекс сектора: у ромба — его центр (сдвиг внутрь на радиус, иначе половина
+    # знака тонет в чёрной стене), у иконки — срез объектива, чтобы обзор
+    # расходился именно от него, а не из-под корпуса.
+    apex_dw = CAM_DOT_DW if diamond else (
+        CAM_ICON_INSET_DW + CAM_ICON_BODY_DW + CAM_ICON_LENS_DW
+    )
+    cx, cy = base[0] + dx * apex_dw, base[1] + dy * apex_dw
 
     out = img.convert("RGB")
     if style != "dot":
@@ -312,11 +333,46 @@ def _paint_camera(img, data: dict, poly: list, P, s: float, *, style: str = "sec
         floor_only = img.point(lambda v: 255 if v == FLOOR else 0)
         out.paste(CAM_SECTOR_RGB, mask=ImageChops.multiply(sector, floor_only))
 
-    r = CAM_DOT_DW
-    ImageDraw.Draw(out).polygon(
-        [P(cx, cy - r), P(cx + r, cy), P(cx, cy + r), P(cx - r, cy)], fill=(INK, INK, INK)
-    )
+    if diamond:
+        r = CAM_DOT_DW
+        ImageDraw.Draw(out).polygon(
+            [P(cx, cy - r), P(cx + r, cy), P(cx, cy + r), P(cx - r, cy)], fill=(INK, INK, INK)
+        )
+    else:
+        _draw_camera_icon(out, P, s, base, (dx, dy))
     return out
+
+
+def _draw_camera_icon(out, P, s: float, base, direction) -> None:
+    """Иконка камеры в точке съёмки: корпус со скруглением + объектив по взгляду.
+
+    Направления камеры только осевые (`CAM_DIR_VEC`), поэтому обе части иконки —
+    обычные прямоугольники в осях листа: скругление рисует Pillow, а сглаживает
+    финальный даунскейл суперсэмпла. Объектив кладётся первым, корпус поверх —
+    так стык двух прямоугольников не виден.
+
+    `base` — точка на ВНУТРЕННЕЙ грани стены; иконка растёт от неё внутрь комнаты.
+    """
+    fx, fy = direction
+    rx, ry = -fy, fx                      # поперечная ось
+    draw = ImageDraw.Draw(out)
+    ink = (INK, INK, INK)
+
+    def box(f0: float, f1: float, half_w: float):
+        a = P(base[0] + fx * f0 - rx * half_w, base[1] + fy * f0 - ry * half_w)
+        b = P(base[0] + fx * f1 + rx * half_w, base[1] + fy * f1 + ry * half_w)
+        return [min(a[0], b[0]), min(a[1], b[1]), max(a[0], b[0]), max(a[1], b[1])]
+
+    px = s * SS                           # dw -> суперсэмпл-пиксели
+    body_end = CAM_ICON_INSET_DW + CAM_ICON_BODY_DW
+    draw.rounded_rectangle(
+        box(body_end - CAM_ICON_LENS_R_DW, body_end + CAM_ICON_LENS_DW, CAM_ICON_LENS_W_DW / 2),
+        radius=CAM_ICON_LENS_R_DW * px, fill=ink,
+    )
+    draw.rounded_rectangle(
+        box(CAM_ICON_INSET_DW, body_end, CAM_ICON_WIDTH_DW / 2),
+        radius=CAM_ICON_BODY_R_DW * px, fill=ink,
+    )
 
 
 def _draw_furniture(dr, P, s, f: dict) -> None:
