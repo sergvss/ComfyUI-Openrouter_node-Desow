@@ -551,6 +551,17 @@ def validate_plan(raw):
     solid_walls = validate_solid_walls(raw.get("solid_walls"), notes)
     if solid_walls:
         plan["solid_walls"] = solid_walls
+        # Проём на стене, которую модель В ТОМ ЖЕ ответе назвала глухой, —
+        # самопротиворечие, и разрешается оно в пользу «глухой»: так отвечают на
+        # зеркальной стене, где проём вычитан из отражения, а не из комнаты.
+        kept = []
+        for opening in plan["openings"]:
+            if opening["wall"] in solid_walls:
+                notes.append("%s на %s: стена объявлена глухой -> проём выброшен"
+                             % (opening["type"], opening["wall"]))
+            else:
+                kept.append(opening)
+        plan["openings"] = kept
     partitions = validate_partitions(raw.get("partitions"), notes)
     if partitions:
         plan["partitions"] = partitions

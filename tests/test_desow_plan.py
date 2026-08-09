@@ -232,6 +232,23 @@ def test_solid_walls_are_parsed_and_garbage_dropped():
     assert any("solid_walls" in n for n in notes)
 
 
+def test_opening_on_a_wall_the_model_called_solid_is_dropped():
+    """Самопротиворечие внутри одного ответа решается в пользу «глухой».
+
+    Так отвечают на зеркальной стене: проём вычитан из отражения, а стена при
+    этом честно названа глухой (кадры fin463, frame13).
+    """
+    plan, notes = validate_plan(plan_with(
+        openings=[
+            {"type": "window", "wall": "back", "offset_dw": 2.0, "width_dw": 1.2},
+            {"type": "door", "wall": "right", "offset_dw": 2.0, "width_dw": 1.6},
+        ],
+        solid_walls=["right"],
+    ))
+    assert [(o["type"], o["wall"]) for o in plan["openings"]] == [("window", "back")]
+    assert any("объявлена глухой" in n for n in notes)
+
+
 def test_broken_swing_is_sanitized_not_dropped():
     plan, notes = validate_plan(plan_with(openings=[
         {"type": "door", "wall": "back", "offset_dw": 1.0, "width_dw": 1.0,
