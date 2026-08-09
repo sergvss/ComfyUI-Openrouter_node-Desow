@@ -540,6 +540,23 @@ def test_gate_does_not_count_the_balcony_door_as_an_entrance():
     assert [o["type"] for o in plan["openings"]].count("balcony_door") == 1   # балконная на месте
 
 
+def test_gate_keeps_the_entrance_away_from_the_camera():
+    """Дверь не режется под знаком камеры: её отрезок стены гейт считает занятым.
+
+    Камера сдвинута в тот угол, куда гейт ставит вход по умолчанию, — дверь
+    обязана уйти к противоположному.
+    """
+    plan = plan_with(
+        openings=[{"type": "window", "wall": "back", "offset_dw": 2.0, "width_dw": 1.5}],
+        camera={**DEFAULT_CAMERA, "position": 0.1},
+    )
+    assert ensure_door_and_window(plan) == ["door_inserted"]
+    door = plan["openings"][-1]
+    assert door["wall"] == "front"
+    camera_at = 0.1 * ROOM["width_dw"]
+    assert abs(door["offset_dw"] - camera_at) > door["width_dw"] / 2 + 0.35
+
+
 def test_gate_counts_the_passage_as_an_entrance():
     # Проход в соседнее помещение — законный вход, вторую дверь рисовать незачем.
     plan = plan_with(openings=[

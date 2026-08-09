@@ -22,6 +22,8 @@
 на ней нет места — ближайшая глухая стена, затем остальные. Место считается по
 `usable_spans`, поэтому «занята» здесь означает физически, а не по числу записей:
 панорамное остекление во всю front-стену свободных интервалов не оставляет.
+Отрезок стены под точкой съёмки тоже считается занятым (`_camera_keepout`):
+вставленный ровно под знаком камеры проём читается как «дверь через камеру».
 
 Обе вставки идут через общий `geometry.place_opening`, то есть считаются с уже
 стоящими проёмами. Перед ними работает `resolve_opening_conflicts`: он разводит
@@ -36,6 +38,7 @@ from __future__ import annotations
 
 from .geometry import clamp, occupied_spans, place_opening, usable_spans, wall_span
 from .schema_lite import (
+    CAMERA_KEEPOUT_DW,
     DEFAULT_WIDTH_DW,
     ENTRANCE_TYPES,
     MIN_CORNER_CLEARANCE_DW,
@@ -121,6 +124,25 @@ def _hinge(wall: str, side: str) -> str:
     return side
 
 
+def _camera_keepout(plan: dict, wall: str, start: float, end: float) -> list:
+    """Занятый отрезок стены под точкой съёмки (пусто, если камера не на этой стене).
+
+    Камера стоит на стене данными плана, а гейт вставляет проёмы в свободное
+    место той же стены. Совпадение позиций даёт чертёж, где дверь прорезана прямо
+    сквозь знак камеры. Отдаём этот отрезок как «занятый» — дальше его учитывает
+    общий `usable_spans`, и никакой особой логики размещению не нужно.
+    """
+    camera = plan.get("camera") or {}
+    if (camera.get("wall") or GATE_WALL) != wall:
+        return []
+    try:
+        position = clamp(float(camera.get("position", 0.5)), 0.0, 1.0)
+    except (TypeError, ValueError):
+        position = 0.5
+    centre = start + position * (end - start)
+    return [(centre - CAMERA_KEEPOUT_DW / 2, centre + CAMERA_KEEPOUT_DW / 2)]
+
+
 def _entrance_walls(openings: list) -> list[str]:
     """Порядок стен-кандидатов для входной двери: front, глухие, затем занятые.
 
@@ -151,7 +173,10 @@ def ensure_door_and_window(plan: dict) -> list[str]:
         width = DEFAULT_WIDTH_DW["door"]
         for wall in _entrance_walls(openings):
             start, end = wall_span(room, wall)
-            spans = usable_spans(start, end, occupied_spans(openings, wall))
+            spans = usable_spans(
+                start, end,
+                occupied_spans(openings, wall) + _camera_keepout(plan, wall, start, end),
+            )
             placement = place_opening(spans, width, start, end, anchor="corner")
             if placement is None:
                 continue
@@ -170,6 +195,9 @@ def ensure_door_and_window(plan: dict) -> list[str]:
 
     present = {op.get("type") for op in openings}
     if not (present & WINDOW_TYPES):
+        # Точка съёмки окну не мешает: окно живёт в толще стены, а знак камеры
+        # стоит внутри комнаты у её грани — они соседи, а не наложение. Обходит
+        # камеру только дверь: её полотно и дуга выметают именно то место.
         width = DEFAULT_WIDTH_DW["window"]
         spans = usable_spans(wall_start, wall_end, occupied_spans(openings, GATE_WALL))
         placement = place_opening(
