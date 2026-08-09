@@ -1,7 +1,7 @@
-# ВЕНДОРЕННЫЙ КОД. Источник: desow/plan2d/gate.py - синхронизировать при правках.
-# Отличие от источника: только импорт схемы (schema -> schema_lite). Двойное
-# ведение осознанное: на машине ComfyUI бэкенда Desow нет (README, «Ноды Desow»).
-"""Гейт проёмов: комната обязана иметь дверь и окно (требование приёмки Фазы 1),
+# КАНОНИЧЕСКИЙ КОД. Пары в бэкенде больше нет: `plan2d/gate.py` удалён вместе со
+# вторым конвейером построения плана - гейт исполняет только воркфлоу (нода
+# DesowPlanRender). Синхронизировать с бэкендом нужно лишь схему (schema_lite.py).
+"""Гейт проёмов: комната обязана иметь вход и окно (требование приёмки Фазы 1),
 и ни один проём не должен налезать на другой или на угол.
 
 Сканер видит только то, что попало в кадр; front-стена находится за камерой,
@@ -9,9 +9,19 @@
 оставался вообще без двери. Промптовое правило «нарисуй дверь, если её не видно»
 срабатывало непредсказуемо, поэтому условие исполняет код:
 
-- нет ни одной двери -> дверь во front-стену у угла (0.2 м от угла до косяка,
-  петли у того же угла, открывание внутрь);
+- нет ни одного ВХОДА -> дверь у угла (0.2 м от угла до косяка, петли у того же
+  угла, открывание внутрь);
 - нет ни одного окна -> окно по центру front-стены.
+
+Вход — это `door`, `double_door` или `passage` (`ENTRANCE_TYPES`): проход в
+соседнее помещение входом является, а балконная дверь (`balcony_door`) — нет,
+она ведёт наружу. Кадр fin424 (панорамное остекление с балконной дверью) до
+этого различения выглядел для гейта как комната с дверью и оставался без входа.
+
+Стена входа: сначала front (она за камерой, вход обычно там и не виден), а если
+на ней нет места — ближайшая глухая стена, затем остальные. Место считается по
+`usable_spans`, поэтому «занята» здесь означает физически, а не по числу записей:
+панорамное остекление во всю front-стену свободных интервалов не оставляет.
 
 Обе вставки идут через общий `geometry.place_opening`, то есть считаются с уже
 стоящими проёмами. Перед ними работает `resolve_opening_conflicts`: он разводит
@@ -27,13 +37,17 @@ from __future__ import annotations
 from .geometry import clamp, occupied_spans, place_opening, usable_spans, wall_span
 from .schema_lite import (
     DEFAULT_WIDTH_DW,
-    DOOR_TYPES,
+    ENTRANCE_TYPES,
     MIN_CORNER_CLEARANCE_DW,
     MIN_OPENING_WIDTH_DW,
     WINDOW_TYPES,
 )
 
 GATE_WALL = "front"
+# Куда уходит вход, если на front-стене места нет. Сначала соседние стены (они
+# ближе к камере и к настоящему входу), back — последней: она в глубине кадра,
+# её видно, и вход, которого там не видели, наименее правдоподобен.
+FALLBACK_WALLS = ("left", "right", "back")
 MIN_WINDOW_WIDTH_DW = 0.8   # окно уже 0.68 м рисовать бессмысленно
 
 
@@ -95,12 +109,37 @@ def resolve_opening_conflicts(plan: dict) -> list[str]:
     return notes
 
 
-def ensure_door_and_window(plan: dict) -> list[str]:
-    """Дополняет `plan['openings']` недостающими дверью/окном. Возвращает пометки.
+def _hinge(wall: str, side: str) -> str:
+    """Петля у того угла, к которому проём прижат.
 
-    Пометки уходят в meta плана: `door_inserted` / `window_inserted` (вставили),
-    `door_gate_skipped` / `window_gate_skipped` (на front-стене не нашлось места —
-    например, она целиком занята панорамным остеклением).
+    На горизонтальных стенах углы называются `left`/`right` (как и сам `side`), на
+    вертикальных — `back`/`front`: ближний к началу стены конец это back-угол.
+    Та же конвенция, что у дефолтных позиций мержа.
+    """
+    if wall in ("left", "right"):
+        return "back" if side == "left" else "front"
+    return side
+
+
+def _entrance_walls(openings: list) -> list[str]:
+    """Порядок стен-кандидатов для входной двери: front, глухие, затем занятые.
+
+    «Глухая» = на стене нет ни одного проёма. Порядок внутри группы фиксирован
+    (`FALLBACK_WALLS`), чтобы план оставался воспроизводимым: две одинаково
+    свободные стены не должны меняться местами от порядка проёмов во входе.
+    """
+    busy = {op.get("wall") for op in openings}
+    rest = sorted(FALLBACK_WALLS, key=lambda w: (w in busy, FALLBACK_WALLS.index(w)))
+    return [GATE_WALL] + rest
+
+
+def ensure_door_and_window(plan: dict) -> list[str]:
+    """Дополняет `plan['openings']` недостающими входом/окном. Возвращает пометки.
+
+    Пометки уходят в meta плана: `door_inserted` (вход встал на front-стену),
+    `door_inserted:<стена>` (front занят, вход ушёл на другую стену),
+    `window_inserted`, а также `door_gate_skipped` / `window_gate_skipped` —
+    места не нашлось нигде / на front-стене.
     """
     notes: list[str] = []
     openings = plan.setdefault("openings", [])
@@ -108,22 +147,26 @@ def ensure_door_and_window(plan: dict) -> list[str]:
     room = plan["room"]
     wall_start, wall_end = wall_span(room, GATE_WALL)
 
-    if not (present & DOOR_TYPES):
+    if not (present & ENTRANCE_TYPES):
         width = DEFAULT_WIDTH_DW["door"]
-        spans = usable_spans(wall_start, wall_end, occupied_spans(openings, GATE_WALL))
-        placement = place_opening(spans, width, wall_start, wall_end, anchor="corner")
-        if placement is None:
-            notes.append("door_gate_skipped")
-        else:
-            offset, eff_width, hinge = placement
+        for wall in _entrance_walls(openings):
+            start, end = wall_span(room, wall)
+            spans = usable_spans(start, end, occupied_spans(openings, wall))
+            placement = place_opening(spans, width, start, end, anchor="corner")
+            if placement is None:
+                continue
+            offset, eff_width, side = placement
             openings.append({
                 "type": "door",
-                "wall": GATE_WALL,
+                "wall": wall,
                 "offset_dw": round(offset, 3),
                 "width_dw": round(eff_width, 3),
-                "swing": {"hinge": hinge, "direction": "in"},
+                "swing": {"hinge": _hinge(wall, side), "direction": "in"},
             })
-            notes.append("door_inserted")
+            notes.append("door_inserted" if wall == GATE_WALL else "door_inserted:%s" % wall)
+            break
+        else:
+            notes.append("door_gate_skipped")
 
     present = {op.get("type") for op in openings}
     if not (present & WINDOW_TYPES):

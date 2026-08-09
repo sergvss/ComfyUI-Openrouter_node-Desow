@@ -151,6 +151,18 @@ def test_broken_openings_are_dropped(opening):
     assert notes
 
 
+def test_balcony_door_is_a_first_class_opening_type():
+    """`balcony_door` разбирается как дверь: тип сохраняется, swing принимается."""
+    plan, notes = validate_plan(plan_with(openings=[
+        {"type": "balcony_door", "wall": "back", "offset_dw": 2.785, "width_dw": 0.9,
+         "swing": {"hinge": "right", "direction": "in"}, "confidence": 0.95},
+    ]))
+    assert notes == []
+    opening = plan["openings"][0]
+    assert opening["type"] == "balcony_door"
+    assert opening["swing"] == {"hinge": "right", "direction": "in"}
+
+
 def test_wall_index_is_allowed_for_l_shape():
     # WallRef в источнике допускает индекс ребра полигона вместо имени стены.
     plan, _ = validate_plan(plan_with(openings=[
@@ -403,6 +415,36 @@ def test_merge_keeps_balcony_door_inside_glazing_on_same_wall():
     assert len(merged["openings"]) == 2
 
 
+def test_merge_scanner_door_covers_vlm_balcony_door():
+    # Сканер подтипов не знает и репортит любую дверь как `door`. Балконная дверь
+    # VLM обязана считаться покрытой, иначе состав расходится, мерж уходит в
+    # деградацию и настоящая геометрия проёма подменяется дефолтом.
+    vlm = plan_with(openings=[
+        {"type": "floor_to_ceiling_window", "wall": "back", "offset_dw": 1.45, "width_dw": 1.3},
+        {"type": "balcony_door", "wall": "back", "offset_dw": 2.785, "width_dw": 0.9},
+    ])
+    scanner = {"openings": [
+        {"type": "floor_to_ceiling_window", "wall": "back"}, {"type": "door", "wall": "back"},
+    ]}
+    merged, meta = merge_with_scanner(scanner, [vlm])
+    assert meta["fallback_scanner_composition"] is False
+    assert meta["added_from_vlm"] == []
+    assert [o["type"] for o in merged["openings"]] == ["floor_to_ceiling_window", "balcony_door"]
+    assert merged["openings"][1]["offset_dw"] == 2.785      # геометрия от VLM
+
+
+def test_merge_fallback_keeps_the_balcony_subtype_on_the_same_wall():
+    # Деградация состава (окна сканера у VLM нет): дверь сканера и балконная дверь
+    # VLM стоят на одной стене — подтип VLM переживает подстановку состава.
+    vlm = plan_with(openings=[
+        {"type": "balcony_door", "wall": "back", "offset_dw": 1.4, "width_dw": 0.9},
+    ])
+    scanner = {"openings": [{"type": "door", "wall": "back"}, {"type": "window", "wall": "left"}]}
+    merged, meta = merge_with_scanner(scanner, [vlm])
+    assert meta["fallback_scanner_composition"] is True
+    assert [o["type"] for o in merged["openings"]] == ["balcony_door", "window"]
+
+
 # ── gate ─────────────────────────────────────────────────────────────
 
 def test_gate_inserts_door_at_front_corner():
@@ -451,11 +493,61 @@ def test_gate_insert_keeps_clearance_from_existing_opening():
     assert_no_overlaps(plan, clearance=MIN_CORNER_CLEARANCE_DW)
 
 
-def test_gate_skips_when_front_wall_is_full():
+def test_gate_moves_the_entrance_to_a_blank_wall_when_front_is_full():
+    # Front занят панорамой во всю стену: вход уходит на ближайшую глухую стену,
+    # а не пропадает (раньше здесь был door_gate_skipped и план без входа).
     plan = plan_with(openings=[
         {"type": "floor_to_ceiling_window", "wall": "front", "offset_dw": 2.0, "width_dw": 4.0},
     ])
+    assert ensure_door_and_window(plan) == ["door_inserted:left"]
+    door = plan["openings"][-1]
+    assert door["type"] == "door" and door["wall"] == "left"
+    assert door["swing"] == {"hinge": "back", "direction": "in"}   # петля у угла прижатия
+    # Простенок от угла отсчитан по своей стене (комната 5.0 dw в глубину).
+    assert door["offset_dw"] == pytest.approx(0.2 / 0.85 + 0.5, abs=1e-3)
+
+
+def test_gate_prefers_a_blank_wall_over_a_busy_one():
+    # Порядок «ближайших» стен — left, right, back; занятая уступает свободной.
+    plan = plan_with(openings=[
+        {"type": "floor_to_ceiling_window", "wall": "front", "offset_dw": 2.0, "width_dw": 4.0},
+        {"type": "window", "wall": "left", "offset_dw": 2.5, "width_dw": 1.6},
+    ])
+    assert ensure_door_and_window(plan) == ["door_inserted:right"]
+
+
+def test_gate_skips_when_every_wall_is_full():
+    plan = plan_with(openings=[
+        {"type": "floor_to_ceiling_window", "wall": "front", "offset_dw": 2.0, "width_dw": 4.0},
+        {"type": "floor_to_ceiling_window", "wall": "back", "offset_dw": 2.0, "width_dw": 4.0},
+        {"type": "floor_to_ceiling_window", "wall": "left", "offset_dw": 2.5, "width_dw": 5.0},
+        {"type": "floor_to_ceiling_window", "wall": "right", "offset_dw": 2.5, "width_dw": 5.0},
+    ])
     assert ensure_door_and_window(plan) == ["door_gate_skipped"]
+
+
+def test_gate_does_not_count_the_balcony_door_as_an_entrance():
+    # Кадр fin424: дверь на балкон внутри остекления ведёт НАРУЖУ, поэтому вход
+    # помещения гейт обязан поставить отдельно.
+    plan = plan_with(openings=[
+        {"type": "floor_to_ceiling_window", "wall": "back", "offset_dw": 1.45, "width_dw": 1.3},
+        {"type": "balcony_door", "wall": "back", "offset_dw": 2.785, "width_dw": 0.9,
+         "swing": {"hinge": "right", "direction": "in"}},
+    ])
+    assert ensure_door_and_window(plan) == ["door_inserted"]
+    door = plan["openings"][-1]
+    assert door["type"] == "door" and door["wall"] == "front"
+    assert [o["type"] for o in plan["openings"]].count("balcony_door") == 1   # балконная на месте
+
+
+def test_gate_counts_the_passage_as_an_entrance():
+    # Проход в соседнее помещение — законный вход, вторую дверь рисовать незачем.
+    plan = plan_with(openings=[
+        {"type": "passage", "wall": "left", "offset_dw": 2.0, "width_dw": 1.2},
+        {"type": "window", "wall": "back", "offset_dw": 2.0, "width_dw": 1.5},
+    ])
+    assert ensure_door_and_window(plan) == []
+    assert len(plan["openings"]) == 2
 
 
 # ── развод конфликтов ────────────────────────────────────────────────
@@ -536,6 +628,24 @@ def test_blank_png_is_white_sheet():
     with Image.open(io.BytesIO(blank_png())) as image:
         assert image.size == (1152, 928)
         assert image.convert("L").getextrema() == (255, 255)
+
+
+def test_balcony_door_is_drawn_with_the_door_symbol():
+    """Символ у `balcony_door` дверной: разрыв + полотно + дуга, лист тот же.
+
+    Отличие типов чисто смысловое (вход/выход), и на чертеже его не должно быть
+    видно — иначе картиночная модель ниже по конвейеру прочтёт вторую нотацию.
+    """
+    swing = {"hinge": "right", "direction": "in"}
+    door = plan_with(openings=[
+        {"type": "door", "wall": "back", "offset_dw": 2.0, "width_dw": 0.9, "swing": swing}])
+    balcony = plan_with(openings=[
+        {"type": "balcony_door", "wall": "back", "offset_dw": 2.0, "width_dw": 0.9, "swing": swing}])
+    blank = plan_with(openings=[])
+    assert render_plan(balcony, with_furniture=False)[0] == render_plan(door, with_furniture=False)[0]
+    assert render_plan(balcony, with_furniture=False)[0] != render_plan(blank, with_furniture=False)[0]
+    # Балконная дверь — тоже дверное полотно, то есть годная линейка масштаба.
+    assert render_plan(balcony, with_furniture=False)[1]["scale_fallback"] is False
 
 
 def test_rendered_plan_is_not_blank():
@@ -771,6 +881,33 @@ def test_v83_f1_default_door_inside_panoramic_window():
     )
     assert_no_overlaps(plan, clearance=MIN_CORNER_CLEARANCE_DW)
     assert len([o for o in plan["openings"] if o["type"] == "door"]) == 1
+
+
+def test_fin424_balcony_door_does_not_replace_the_entrance():
+    """fin424: панорама с балконной дверью на back; вход должен появиться отдельно.
+
+    До различения типов гейт видел на плане `door` и считал, что вход есть, —
+    комната оставалась без входа, хотя единственная её дверь ведёт на балкон.
+    """
+    plan, debug = run_case(
+        {"room": {"shape": "rectangle", "width_dw": 3.8, "depth_dw": 5.6},
+         "openings": [
+             {"type": "floor_to_ceiling_window", "wall": "back", "offset_dw": 1.45,
+              "width_dw": 1.3, "confidence": 0.95},
+             {"type": "balcony_door", "wall": "back", "offset_dw": 2.785, "width_dw": 0.9,
+              "swing": {"hinge": "right", "direction": "in"}, "confidence": 0.95},
+         ]},
+        {"openings": [
+            {"type": "floor_to_ceiling_window", "wall": "back", "confidence": 0.95},
+            {"type": "door", "wall": "back", "confidence": 0.9},
+        ]},
+    )
+    placed = [(o["type"], o["wall"]) for o in plan["openings"]]
+    assert ("balcony_door", "back") in placed        # балконная осталась в остеклении
+    assert ("door", "front") in placed               # вход поставил гейт
+    assert "merge: состав VLM покрыл сканер" in debug
+    assert "gate: door_inserted" in debug
+    assert_no_overlaps(plan, clearance=MIN_CORNER_CLEARANCE_DW)
 
 
 @pytest.mark.parametrize("tag, extraction, scanner", [

@@ -30,6 +30,7 @@ from .schema_lite import (
     CONTACT_TOL_DW,
     DOOR_APPROACH_M,
     DOOR_FRAME_CLEAR_M,
+    DOOR_TYPES,
     DW_M,
     OPENING_FRONT_KINDS,
     PASSAGE_CLEAR_M,
@@ -148,7 +149,7 @@ def validate_structure(data: dict) -> list[str]:
                 errs.append(
                     f"{op.get('type')} на {wall}: [{off - w / 2:.2f}..{off + w / 2:.2f}] вне стены 0..{wl}"
                 )
-        if op.get("type") in ("door", "double_door") and not op.get("swing"):
+        if op.get("type") in DOOR_TYPES and not op.get("swing"):
             errs.append(f"дверь на {wall} без swing")
         by_wall.setdefault(str(wall), []).append((off - w / 2, off + w / 2))
     for wall, spans in by_wall.items():
@@ -214,7 +215,7 @@ def validate_furniture(room_data: dict, furniture: list) -> list[str]:
 
     # Дуга двери: петля — центр дуги, радиус = ширина проёма.
     for op in room_data.get("openings", []):
-        if op["type"] not in ("door", "double_door"):
+        if op["type"] not in DOOR_TYPES:
             continue
         off, w = float(op["offset_dw"]), float(op["width_dw"])
         hinge = (op.get("swing") or {}).get("hinge", "back")
@@ -250,7 +251,7 @@ def validate_furniture(room_data: dict, furniture: list) -> list[str]:
                     errs.append(
                         f"{kind} перекрывает полосу {WINDOW_STRIP_M} м перед окном на {op['wall']}"
                     )
-        elif nt in ("door", "double_door"):
+        elif nt in DOOR_TYPES:
             w = float(op["width_dw"])
             zone = _zone_from_span(c0, c1, n_in, w + DOOR_APPROACH_M / DW_M)
             for kind, x0, y0, x1, y1 in rects:

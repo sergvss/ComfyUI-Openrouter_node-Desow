@@ -35,8 +35,15 @@ import math
 DW_M = 0.85           # 1 dw = 0.85 м
 WALL_T_DW = 0.25      # толщина стены = четверть ширины двери
 
-DOOR_TYPES = frozenset({"door", "double_door"})
+# Всё, что рисуется и проверяется как дверь: разрыв стены, полотно, дуга, подход.
+# `balcony_door` — дверь наружу (в остеклении, на балкон/лоджию/террасу): символ и
+# эргономика у неё дверные, отличается только смысл — она НЕ вход в помещение.
+DOOR_TYPES = frozenset({"door", "double_door", "balcony_door"})
 WINDOW_TYPES = frozenset({"window", "floor_to_ceiling_window"})
+# Чем можно войти в комнату. Балконная дверь ведёт наружу, поэтому вход помещения
+# обязан быть на плане отдельно (гейт вставляет его сам); `passage` — проход в
+# соседнее помещение, законный вход.
+ENTRANCE_TYPES = frozenset({"door", "double_door", "passage"})
 OPENING_TYPES = frozenset(DOOR_TYPES | WINDOW_TYPES | {"passage"})
 
 WALL_NAMES = frozenset({"back", "front", "left", "right"})

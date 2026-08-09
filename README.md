@@ -27,8 +27,8 @@ A custom node for ComfyUI that allows you to interact with OpenRouter's API, pro
 | Модуль ноды | Источник в репозитории `desow` |
 |---|---|
 | `desow_plan/geometry.py` | `plan2d/geometry.py` (различие: строка импорта) — общее размещение проёмов (`usable_spans` / `place_opening`) |
-| `desow_plan/merge.py` | `plan2d/merge.py` (различие: строка импорта) |
-| `desow_plan/gate.py` | `plan2d/gate.py` (различие: строка импорта) |
+| `desow_plan/merge.py` | пары нет: `plan2d/merge.py` удалён, мерж исполняет только граф |
+| `desow_plan/gate.py` | пары нет: `plan2d/gate.py` удалён, гейт исполняет только граф |
 | `desow_plan/render.py` | `plan2d/render.py` (различие: строка импорта) |
 | `desow_plan/validate.py` | `plan2d/validate.py` (различие: строка импорта) — эргономика расстановки |
 | `desow_plan/furnish.py` | `plan2d/furnish.py` (промпт и цикл ре-промптов; отличия в шапке файла) |

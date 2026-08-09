@@ -6,7 +6,8 @@
 Графстандарт (замерен пипеткой по эталону промптового пути v35):
 - холст 1152x928, лист белый (255), пол светло-серый (237), стены сплошной чёрный (0);
 - толщина стены = 1/4 ширины двери (эталон: проём 148 px, стена 37 px);
-- дверь: разрыв в стене + полотно (тонкий белый прямоугольник с контуром) + четвертьдуга;
+- дверь: разрыв в стене + полотно (тонкий белый прямоугольник с контуром) + четвертьдуга
+  (одинаково для `door` и `balcony_door` — они различаются смыслом, а не символом);
 - окно: разрыв + линии по граням стены + двойной штрих + торцевые перемычки;
 - проход (passage): чистый разрыв в цвет пола;
 - мебель: белая заливка, тонкий чёрный контур, без текста;
@@ -32,7 +33,7 @@ from .geometry import (
     wall_params,
     wall_span,
 )
-from .schema_lite import DW_M, WALL_T_DW
+from .schema_lite import DOOR_TYPES, DW_M, WALL_T_DW
 
 # --- константы графстандарта (в финальных пикселях) ---
 CANVAS = (1152, 928)
@@ -85,7 +86,7 @@ def render_plan(
     t_dw = WALL_T_DW
     ext = {"left": 0.0, "right": 0.0, "back": 0.0, "front": 0.0}
     for op in data.get("openings", []):
-        if op.get("type") in ("door", "double_door") and (op.get("swing") or {}).get("direction") == "out":
+        if op.get("type") in DOOR_TYPES and (op.get("swing") or {}).get("direction") == "out":
             wall = op.get("wall")
             if wall in ext:
                 r = float(op.get("width_dw", 1.0))
@@ -195,7 +196,7 @@ def render_plan(
             for frac in (0.37, 0.63):                                           # двойной штрих
                 line_dw((c0[0] + nx * t_dw * frac, c0[1] + ny * t_dw * frac),
                         (c1[0] + nx * t_dw * frac, c1[1] + ny * t_dw * frac))
-        elif op["type"] in ("door", "double_door"):
+        elif op["type"] in DOOR_TYPES:
             swing = op.get("swing") or {}
             direction = swing.get("direction", "in")
             hinge = swing.get("hinge")
@@ -229,7 +230,7 @@ def render_plan(
                     start, end = a1, a0
                 dr.arc(bbox, start=start, end=end, fill=INK, width=max(1, thin // 2))
 
-            if op["type"] == "door":
+            if op["type"] != "double_door":   # одностворчатая: door и balcony_door
                 hp = c0 if hinge_at_c0 else c1
                 other = c1 if hinge_at_c0 else c0
                 draw_leaf_arc(hp, other, half * 2)
@@ -250,7 +251,7 @@ def render_plan(
     final = img.resize(CANVAS, Image.LANCZOS)
     buf = io.BytesIO()
     final.save(buf, format="PNG")
-    has_door = any(o.get("type") in ("door", "double_door") for o in data.get("openings", []))
+    has_door = any(o.get("type") in DOOR_TYPES for o in data.get("openings", []))
     meta = {
         "px_per_dw": round(s, 3),
         "wall_px": round(t_dw * s, 2),
