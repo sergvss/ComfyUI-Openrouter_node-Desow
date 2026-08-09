@@ -630,6 +630,32 @@ def test_blank_png_is_white_sheet():
         assert image.convert("L").getextrema() == (255, 255)
 
 
+def test_front_attached_partition_grows_from_the_bottom_wall():
+    """Простенок от front-стены (той, что за спиной камеры) — полноправный вход.
+
+    Кадр l_room_synthetic: у правого края кадра стена видна ребром, растёт
+    из-за спины камеры и на плане описывается как `attach: front`. Сторону
+    роста задаёт геометрия, поэтому проверяем пикселями: блок front-простенка
+    целиком ниже блока такого же back-простенка.
+    """
+    base = plan_with(openings=[{"type": "door", "wall": "left", "offset_dw": 1.0, "width_dw": 1.0}])
+    plain, _ = render_plan(base, with_furniture=False)
+
+    def sheet(attach):
+        plan, notes = validate_plan(
+            dict(base, partitions=[{"attach": attach, "offset_dw": 3.0, "length_dw": 2.0}]))
+        assert notes == [] and plan["partitions"][0]["attach"] == attach
+        return render_plan(plan, with_furniture=False)[0]
+
+    front, back = sheet("front"), sheet("back")
+    assert front != back
+    with Image.open(io.BytesIO(plain)) as p, Image.open(io.BytesIO(front)) as f, \
+            Image.open(io.BytesIO(back)) as b:
+        box_f = ImageChops.difference(p, f).getbbox()
+        box_b = ImageChops.difference(p, b).getbbox()
+    assert box_f[1] > box_b[3], (box_f, box_b)      # комната 5.0 dw: блоки не пересекаются
+
+
 def test_balcony_door_is_drawn_with_the_door_symbol():
     """Символ у `balcony_door` дверной: разрыв + полотно + дуга, лист тот же.
 
