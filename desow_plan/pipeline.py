@@ -121,10 +121,12 @@ def build_empty_plan(extraction_json, scanner_openings_json="", room_type=""):
     for kind, vlm_wall, scan_wall in merge_meta["paired_wall_dispute"]:
         # Один проём, прочитанный с разными стенами, а не два разных.
         debug.append("merge_pair: %s %s→%s (спор о стене, взята стена сканера)" % (kind, vlm_wall, scan_wall))
-    for key, wall in merge_meta["moved_to_wall"]:
-        debug.append("merge_move: %s -> стена %s (на своей нет места)" % (key, wall))
+    for key, was, now in merge_meta["narrowed"]:
+        debug.append("merge_narrow: %s сужен %.2f->%.2f dw (на своей стене места меньше)" % (key, was, now))
     for key in merge_meta["dropped_no_space"]:
-        debug.append("merge_drop: %s выброшен (места нет ни на одной стене)" % (key,))
+        debug.append("merge_drop: %s выброшен (на своей стене места нет)" % (key,))
+    for key in merge_meta["dropped_unconfirmed"]:
+        debug.append("merge_dropped_unconfirmed: %s выброшен (VLM назвал стену глухой)" % (key,))
 
     # 3) Развод конфликтов: наложения и проёмы впритык к углу приходят и от VLM,
     # и из дефолтных позиций мержа. До гейта, чтобы он считал свободные интервалы

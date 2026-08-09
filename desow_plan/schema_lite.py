@@ -135,6 +135,28 @@ MIN_CORNER_CLEARANCE_DW = MIN_CORNER_CLEARANCE_M / DW_M
 # Уже 0.6 м проём сужать бессмысленно — такой проём выбрасывается целиком.
 MIN_OPENING_WIDTH_DW = 0.7
 
+# До какой ширины разрешено сужать РЕАЛЬНЫЙ (виденный) проём, которому не хватило
+# места на своей стене. Переносить его на другую стену нельзя: стену называют и
+# сканер, и VLM, а «места не хватило» — это ошибка обмера, а не ошибка стены
+# (кадр frame15: сегмент панорамы уехал за спину камеры и стал стеной-призраком).
+# Дверь уже 0.7 м в жилом проходе не встречается; окно 0.3 м — это уже узкая
+# створка, всё что уже — щель, которую честнее не рисовать вовсе.
+MIN_KEPT_WIDTH_M = {"door": 0.7, "passage": 0.7, "window": 0.3}
+
+
+def min_kept_width_dw(kind: str) -> float:
+    """Нижняя граница сужения проёма данного типа, в dw."""
+    return MIN_KEPT_WIDTH_M.get(kind if kind in MIN_KEPT_WIDTH_M else _norm_kind(kind), 0.7) / DW_M
+
+
+def _norm_kind(kind: str) -> str:
+    """Тип проёма в терминах порогов: подтипы дверей и окон ведут себя одинаково."""
+    if kind in DOOR_TYPES:
+        return "door"
+    if kind in WINDOW_TYPES:
+        return "window"
+    return kind
+
 # Верхняя граница любой длины в схеме: 30 dw = 25.5 м. Жилая комната такого
 # размера не встречается — значение за границей означает галлюцинацию модели
 # (перепутанные единицы, «5900» вместо 5.9). Пропустить её нельзя: масштаб
@@ -275,8 +297,36 @@ def _swing(raw, notes, label):
     return {"hinge": hinge, "direction": direction}
 
 
-def validate_openings(raw, notes):
-    """Список проёмов. Битый проём выбрасывается с пометкой, остальные остаются."""
+def _default_hinge(wall, offset_dw, room):
+    """Петли у БЛИЖНЕГО к проёму угла — норма, по которой дверь открывается к
+    стене, а не поперёк прохода.
+
+    Стену длиной знаем только у прямоугольной комнаты с именованной стеной; в
+    остальных случаях (l_shape, стена индексом ребра) остаётся дефолт источника,
+    но с правильной ориентацией: у горизонтальных стен углы `left`/`right`, у
+    вертикальных — `back`/`front`.
+    """
+    horizontal = wall in ("back", "front")
+    if not isinstance(wall, str) or wall not in WALL_LEN_KEYS or room.get("shape") != "rectangle":
+        return "left" if horizontal else "back"
+    try:
+        length = float(room[WALL_LEN_KEYS[wall]])
+    except (TypeError, ValueError, KeyError):
+        return "left" if horizontal else "back"
+    near_start = offset_dw <= length / 2
+    if horizontal:
+        return "left" if near_start else "right"
+    return "back" if near_start else "front"
+
+
+def validate_openings(raw, notes, room=None):
+    """Список проёмов. Битый проём выбрасывается с пометкой, остальные остаются.
+
+    Дверь без `swing` получает его по нормам (открывание внутрь помещения, петли
+    у ближнего угла) — раньше поле просто отсутствовало, `validate_structure`
+    ругался «дверь без swing», а рендер молча подставлял свои дефолты, то есть
+    план и его же проверка расходились на ровном месте.
+    """
     if raw is None:
         return []
     if not isinstance(raw, list):
@@ -308,8 +358,15 @@ def validate_openings(raw, notes):
         except PlanDataError as exc:
             notes.append("%s -> выброшен" % exc)
             continue
-        if kind in DOOR_TYPES and entry.get("swing") is not None:
-            opening["swing"] = _swing(entry.get("swing"), notes, label)
+        if kind in DOOR_TYPES:
+            if entry.get("swing") is None:
+                opening["swing"] = {
+                    "hinge": _default_hinge(wall, opening["offset_dw"], room or {}),
+                    "direction": "in",
+                }
+                notes.append("%s: swing_defaulted (внутрь, петли к ближнему углу)" % label)
+            else:
+                opening["swing"] = _swing(entry.get("swing"), notes, label)
         if entry.get("confidence") is not None:
             try:
                 opening["confidence"] = _number(entry.get("confidence"), label + ".confidence")
@@ -353,6 +410,31 @@ def validate_camera(raw, notes):
     if raw.get("marker") is not None and raw.get("marker") not in CAMERA_MARKERS:
         notes.append("camera.marker=%r не из словаря -> %s" % (raw.get("marker"), DEFAULT_CAMERA["marker"]))
     return camera
+
+
+# ── Глухие стены ─────────────────────────────────────────────────────
+
+def validate_solid_walls(raw, notes):
+    """Стены, про которые VLM ЯВНО сказал «проёмов нет» -> список имён стен.
+
+    Нужны мержу как право возразить сканеру. Детектор проёмов ошибается на
+    отражениях: зеркальный шкаф-купе во всю стену он репортит дверью (кадр
+    frame13), и состав сканера восстанавливал эту дверь даже там, где модель
+    описала стену как глухую. Молчание VLM возражением не считается — сканер
+    по-прежнему «пол, а не потолок»; возражение — только явная запись здесь.
+    """
+    if raw is None:
+        return []
+    if not isinstance(raw, (list, tuple)):
+        notes.append("solid_walls: ожидался список, получено %s -> пусто" % type(raw).__name__)
+        return []
+    out = []
+    for value in raw:
+        if value in WALL_NAMES and value not in out:
+            out.append(value)
+        elif value not in WALL_NAMES:
+            notes.append("solid_walls: стена %r не из словаря -> пропущена" % (value,))
+    return out
 
 
 # ── Простенки ────────────────────────────────────────────────────────
@@ -460,11 +542,15 @@ def validate_plan(raw):
     if not isinstance(raw, dict):
         raise PlanDataError("план: ожидался объект, получено %s" % type(raw).__name__)
     notes = []
+    room = validate_room(raw.get("room"), notes)
     plan = {
-        "room": validate_room(raw.get("room"), notes),
-        "openings": validate_openings(raw.get("openings"), notes),
+        "room": room,
+        "openings": validate_openings(raw.get("openings"), notes, room),
         "camera": validate_camera(raw.get("camera"), notes),
     }
+    solid_walls = validate_solid_walls(raw.get("solid_walls"), notes)
+    if solid_walls:
+        plan["solid_walls"] = solid_walls
     partitions = validate_partitions(raw.get("partitions"), notes)
     if partitions:
         plan["partitions"] = partitions

@@ -40,10 +40,11 @@ from .geometry import clamp, occupied_spans, place_opening, usable_spans, wall_s
 from .schema_lite import (
     CAMERA_KEEPOUT_DW,
     DEFAULT_WIDTH_DW,
+    DW_M,
     ENTRANCE_TYPES,
     MIN_CORNER_CLEARANCE_DW,
-    MIN_OPENING_WIDTH_DW,
     WINDOW_TYPES,
+    min_kept_width_dw,
 )
 
 GATE_WALL = "front"
@@ -52,6 +53,11 @@ GATE_WALL = "front"
 # её видно, и вход, которого там не видели, наименее правдоподобен.
 FALLBACK_WALLS = ("left", "right", "back")
 MIN_WINDOW_WIDTH_DW = 0.8   # окно уже 0.68 м рисовать бессмысленно
+# Простенок «в обрез» для узкой стены: 0.1 м вместо обычных 0.2. Норму 0.2 м
+# держим сколько можем, но в коридоре шириной 1.15 м (кадр frame14) выбор стоит
+# так: либо вход с уменьшенным простенком там, где он на самом деле есть, либо
+# нормативный простенок и дверь на длинной глухой стене. Первое честнее.
+TIGHT_CORNER_CLEARANCE_DW = 0.1 / DW_M
 
 
 def resolve_opening_conflicts(plan: dict) -> list[str]:
@@ -87,7 +93,9 @@ def resolve_opening_conflicts(plan: dict) -> list[str]:
         for op in sorted(items, key=lambda o: float(o.get("offset_dw", 0))):
             width = float(op.get("width_dw", 0))
             available = end - MIN_CORNER_CLEARANCE_DW - cursor
-            if available < min(width, MIN_OPENING_WIDTH_DW):
+            # Нижняя граница сужения — своя у каждого типа: окно доживает до
+            # 0.3 м, дверь только до 0.7 м (уже — не дверь, а щель).
+            if available < min(width, min_kept_width_dw(op.get("type", ""))):
                 dropped.add(id(op))
                 notes.append("dropped:%s/%s" % (op.get("type"), wall))
                 continue
@@ -170,14 +178,36 @@ def ensure_door_and_window(plan: dict) -> list[str]:
     wall_start, wall_end = wall_span(room, GATE_WALL)
 
     if not (present & ENTRANCE_TYPES):
-        width = DEFAULT_WIDTH_DW["door"]
+        want = DEFAULT_WIDTH_DW["door"]
+        narrow = min_kept_width_dw("door")
+        # Стену меняем ПОСЛЕДНЕЙ. Сначала на текущей пробуем норму, затем дверь
+        # минимальной ширины с простенком в обрез: узкая комната (коридор,
+        # гардеробная) не повод уводить вход на длинную глухую стену, где его
+        # никто не видел. Приоритет front сохраняется целиком.
         for wall in _entrance_walls(openings):
             start, end = wall_span(room, wall)
-            spans = usable_spans(
-                start, end,
-                occupied_spans(openings, wall) + _camera_keepout(plan, wall, start, end),
-            )
-            placement = place_opening(spans, width, start, end, anchor="corner")
+            busy = occupied_spans(openings, wall)
+            keepout = _camera_keepout(plan, wall, start, end)
+            # Попытки по убыванию строгости: норма -> простенок в обрез -> (только
+            # на front) без обхода знака камеры. Последняя ступень для комнат вроде
+            # коридора frame14: там знак камеры занимает середину единственной
+            # короткой стены, и обходить его негде. Знак — косметика чертежа, а
+            # стена входа — геометрия; снимали как раз из этого проёма.
+            attempts = [
+                (MIN_CORNER_CLEARANCE_DW, busy + keepout),
+                (TIGHT_CORNER_CLEARANCE_DW, busy + keepout),
+            ]
+            if wall == GATE_WALL:
+                attempts.append((TIGHT_CORNER_CLEARANCE_DW, busy))
+            placement, under_camera = None, False
+            for step, (clearance, occupied) in enumerate(attempts):
+                spans = usable_spans(start, end, occupied, clearance)
+                placement = place_opening(
+                    spans, want, start, end, anchor="corner", min_width=narrow
+                )
+                if placement is not None:
+                    under_camera = step == 2
+                    break
             if placement is None:
                 continue
             offset, eff_width, side = placement
@@ -189,6 +219,10 @@ def ensure_door_and_window(plan: dict) -> list[str]:
                 "swing": {"hinge": _hinge(wall, side), "direction": "in"},
             })
             notes.append("door_inserted" if wall == GATE_WALL else "door_inserted:%s" % wall)
+            if eff_width < want - 1e-6:
+                notes.append("door_narrowed:%.2f" % eff_width)
+            if under_camera:
+                notes.append("door_under_camera")
             break
         else:
             notes.append("door_gate_skipped")

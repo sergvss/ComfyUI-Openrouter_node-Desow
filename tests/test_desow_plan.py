@@ -14,6 +14,7 @@ from desow_plan.gate import ensure_door_and_window, resolve_opening_conflicts
 from desow_plan.merge import merge_with_scanner, scanner_openings_from_scan
 from desow_plan.render import CANVAS, render_plan
 from desow_plan.scanner import parse_scanner_openings
+from desow_plan.validate import validate_structure
 from desow_plan.schema_lite import (
     DEFAULT_CAMERA,
     MIN_CORNER_CLEARANCE_DW,
@@ -190,6 +191,47 @@ def test_wall_index_is_allowed_for_l_shape():
     assert plan["openings"][0]["wall"] == 2
 
 
+@pytest.mark.parametrize("wall, offset, hinge", [
+    ("back", 1.0, "left"),      # комната 4.0 dw в ширину: ближний угол — левый
+    ("back", 3.0, "right"),
+    ("front", 1.0, "left"),
+    ("left", 1.0, "back"),      # вертикальная стена 5.0 dw: ближний угол — back
+    ("left", 4.0, "front"),
+    ("right", 4.0, "front"),
+])
+def test_door_without_swing_gets_the_default_one(wall, offset, hinge):
+    """Дверь без `swing` получает норму: внутрь, петли у ближнего угла.
+
+    Раньше поле просто отсутствовало: `validate_structure` ругался «дверь без
+    swing», а рендер молча брал свои дефолты — план расходился со своей проверкой.
+    """
+    plan, notes = validate_plan(plan_with(openings=[
+        {"type": "door", "wall": wall, "offset_dw": offset, "width_dw": 1.0}]))
+    assert plan["openings"][0]["swing"] == {"hinge": hinge, "direction": "in"}
+    assert any("swing_defaulted" in n for n in notes)
+    assert validate_structure(plan) == []
+
+
+def test_balcony_door_without_swing_opens_into_the_room():
+    plan, _ = validate_plan(plan_with(openings=[
+        {"type": "balcony_door", "wall": "back", "offset_dw": 2.0, "width_dw": 0.9}]))
+    assert plan["openings"][0]["swing"]["direction"] == "in"
+
+
+def test_explicit_swing_is_not_overwritten():
+    plan, notes = validate_plan(plan_with(openings=[
+        {"type": "door", "wall": "back", "offset_dw": 1.0, "width_dw": 1.0,
+         "swing": {"hinge": "right", "direction": "out"}}]))
+    assert plan["openings"][0]["swing"] == {"hinge": "right", "direction": "out"}
+    assert not any("swing_defaulted" in n for n in notes)
+
+
+def test_solid_walls_are_parsed_and_garbage_dropped():
+    plan, notes = validate_plan(plan_with(solid_walls=["right", "ceiling", "right"]))
+    assert plan["solid_walls"] == ["right"]
+    assert any("solid_walls" in n for n in notes)
+
+
 def test_broken_swing_is_sanitized_not_dropped():
     plan, notes = validate_plan(plan_with(openings=[
         {"type": "door", "wall": "back", "offset_dw": 1.0, "width_dw": 1.0,
@@ -351,8 +393,13 @@ def test_merge_defaults_do_not_stack_on_each_other():
     assert_no_overlaps(merged)
 
 
-def test_merge_moves_default_to_another_wall_when_no_room():
-    # Боевой кадр f1: панорама занимает почти всю стену, дефолтной двери места нет.
+def test_merge_never_moves_an_opening_to_another_wall():
+    """Боевой кадр f1: панорама заняла стену, дефолтной двери места нет.
+
+    Стену называют оба источника, поэтому переезд запрещён: дверь либо сужается
+    в пределах своей стены, либо выбрасывается. Прежний перенос на соседнюю
+    стену давал проём-призрак (кадр frame15 — остекление за спиной камеры).
+    """
     vlm = plan_with(openings=[
         {"type": "floor_to_ceiling_window", "wall": "left", "offset_dw": 2.5, "width_dw": 4.6},
     ])
@@ -360,10 +407,58 @@ def test_merge_moves_default_to_another_wall_when_no_room():
         {"type": "floor_to_ceiling_window", "wall": "left"}, {"type": "door", "wall": "left"},
     ]}
     merged, meta = merge_with_scanner(scanner, [vlm])
-    door = next(o for o in merged["openings"] if o["type"] == "door")
-    assert door["wall"] == "right"                       # та же ориентация
-    assert meta["moved_to_wall"] == [(("door", "left"), "right")]
+    assert [o["wall"] for o in merged["openings"]] == ["left"]   # ни один не уехал
+    assert meta["dropped_no_space"] == [("door", "left")]
+    assert "moved_to_wall" not in meta
     assert_no_overlaps(merged)
+
+
+def test_merge_narrows_an_opening_that_almost_fits():
+    """Место на своей стене есть, но меньше дефолтной ширины — проём сужается.
+
+    Окно доживает до 0.3 м (0.35 dw), и это правильнее переезда: стена верная,
+    ошибка только в обмере ширины.
+    """
+    vlm = plan_with(openings=[
+        {"type": "window", "wall": "back", "offset_dw": 1.4, "width_dw": 1.8},
+    ])
+    scanner = {"openings": [{"type": "window", "wall": "back"}, {"type": "window", "wall": "back"}]}
+    merged, meta = merge_with_scanner(scanner, [vlm])
+    assert [o["wall"] for o in merged["openings"]] == ["back", "back"]
+    assert meta["narrowed"] and meta["narrowed"][0][0] == ("window", "back")
+    narrowed = merged["openings"][1]
+    assert 0.35 <= narrowed["width_dw"] < 1.6
+    assert_no_overlaps(merged)
+
+
+def test_merge_keeps_the_scanner_opening_when_vlm_is_silent():
+    """Молчание VLM возражением не считается: сканер остаётся «полом».
+
+    Возразить может только явная запись `solid_walls` — см. соседний тест.
+    """
+    vlm = plan_with(openings=[{"type": "window", "wall": "back", "offset_dw": 2.0, "width_dw": 1.5}])
+    scanner = {"openings": [{"type": "window", "wall": "back"}, {"type": "door", "wall": "right"}]}
+    merged, meta = merge_with_scanner(scanner, [vlm])
+    assert ("door", "right") in [(o["type"], o["wall"]) for o in merged["openings"]]
+    assert meta["dropped_unconfirmed"] == []
+
+
+def test_merge_drops_the_scanner_door_on_a_wall_vlm_called_solid():
+    """Кадр frame13: сканер принял зеркальный шкаф-купе за дверь на правой стене.
+
+    VLM назвал ту стену глухой (`solid_walls`), и это активное противоречие —
+    дефолтная дверь не восстанавливается, стена остаётся глухой.
+    """
+    vlm = plan_with(
+        openings=[{"type": "window", "wall": "back", "offset_dw": 2.0, "width_dw": 1.1}],
+        solid_walls=["right"],
+    )
+    plan, notes = validate_plan(vlm)
+    assert plan["solid_walls"] == ["right"] and notes == []
+    scanner = {"openings": [{"type": "window", "wall": "back"}, {"type": "door", "wall": "right"}]}
+    merged, meta = merge_with_scanner(scanner, [plan])
+    assert [o["wall"] for o in merged["openings"]] == ["back"]
+    assert meta["dropped_unconfirmed"] == [("door", "right")]
 
 
 def test_merge_pairs_same_type_on_disputed_wall():
@@ -475,6 +570,34 @@ def test_gate_inserts_door_at_front_corner():
     assert door["swing"] == {"hinge": "left", "direction": "in"}
     # 0.2 м от угла до косяка при ширине 1 dw: центр = 0.2/0.85 + 0.5
     assert door["offset_dw"] == pytest.approx(0.2 / 0.85 + 0.5, abs=1e-3)
+
+
+def test_gate_narrows_the_entrance_instead_of_leaving_the_front_wall():
+    """Кадр frame14: коридор 1.15 м шириной — вход остаётся на front, но уже.
+
+    Дверь 1.0 dw с простенками 0.2 м требует 1.4 dw; раньше гейт при нехватке
+    уводил вход на длинную боковую стену, хотя снимали именно из проёма во front.
+    """
+    plan = {"room": {"shape": "rectangle", "width_dw": 1.35, "depth_dw": 4.8},
+            "openings": [{"type": "window", "wall": "back", "offset_dw": 0.675, "width_dw": 0.88}]}
+    plan["camera"] = dict(DEFAULT_CAMERA)
+    notes = ensure_door_and_window(plan)
+    door = plan["openings"][-1]
+    assert door["wall"] == "front"                       # стена не сменилась
+    assert "door_inserted" in notes
+    assert door["width_dw"] >= 0.82                      # не уже 0.7 м
+    # Простенок «в обрез» 0.1 м вместо нормы 0.2 — цена того, что вход остался там,
+    # где он есть на самом деле.
+    assert door["offset_dw"] - door["width_dw"] / 2 >= 0.1 / 0.85 - 1e-3
+
+
+def test_gate_leaves_the_front_wall_only_when_even_a_narrow_door_does_not_fit():
+    """Стена уже минимальной двери — только тогда вход уходит на соседнюю."""
+    plan = {"room": {"shape": "rectangle", "width_dw": 0.9, "depth_dw": 4.8}, "openings": []}
+    notes = ensure_door_and_window(plan)
+    door = next(o for o in plan["openings"] if o["type"] == "door")
+    assert door["wall"] != "front"
+    assert any(n.startswith("door_inserted:") for n in notes)
 
 
 def test_gate_inserts_window_at_front_center():
@@ -674,7 +797,8 @@ def test_front_attached_partition_grows_from_the_bottom_wall():
     роста задаёт геометрия, поэтому проверяем пикселями: блок front-простенка
     целиком ниже блока такого же back-простенка.
     """
-    base = plan_with(openings=[{"type": "door", "wall": "left", "offset_dw": 1.0, "width_dw": 1.0}])
+    base = plan_with(openings=[{"type": "door", "wall": "left", "offset_dw": 1.0, "width_dw": 1.0,
+                                "swing": {"hinge": "back", "direction": "in"}}])
     plain, _ = render_plan(base, with_furniture=False)
 
     def sheet(attach):
@@ -1000,7 +1124,10 @@ def test_v83_e4_three_scanner_openings_on_one_wall():
         ]},
     )
     assert_no_overlaps(plan, clearance=MIN_CORNER_CLEARANCE_DW)
-    assert "merge_move:" in debug           # окну не хватило места на правой стене
+    # Второй двери сканера места на правой стене нет — она выбрасывается, а не
+    # переезжает на чужую стену (переезд запрещён).
+    assert "merge_drop:" in debug
+    assert not any(o["wall"] == "left" for o in plan["openings"])
     assert "moved:passage/back" in debug    # угол закрыт
 
 
