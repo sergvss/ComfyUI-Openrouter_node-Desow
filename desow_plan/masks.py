@@ -208,6 +208,94 @@ def floor_support(floor: np.ndarray):
     return pts, err, lines
 
 
+# Порог выбора угловой модели фита: она обязана быть заметно точнее
+# фронтальной (не на волосок), иначе кадр читается как фронтальный.
+CORNER_FIT_ADVANTAGE = 1.5
+# Излом угловой модели должен лежать в кадре с запасом от краёв.
+CORNER_X_MIN, CORNER_X_MAX = 0.05, 0.95
+
+
+def _column_profile(floor: np.ndarray):
+    xs, ys = [], []
+    for x in range(0, GRID_W, 4):
+        col = np.where(floor[:, x])[0]
+        if len(col) > 5:
+            xs.append(x)
+            ys.append(col.min())
+    return np.array(xs, float), np.array(ys, float)
+
+
+def floor_support_corner(floor: np.ndarray):
+    """Угловая модель опоры: ДВЕ прямые плинтусов с изломом-ребром.
+
+    Кадр «в угол» (двухточечная перспектива, разметка пользователя 2026-08-11):
+    верхняя граница пола - два сегмента, их пересечение = вертикальное ребро
+    угла комнаты. Возврат: (corner_x 0..1, err, {left:(k,b), right:(k,b)})
+    или None. Калибровка: пустая гостиная declutter-эксперимента - излом на
+    x=0.715 при разметке пользователя ~0.7.
+    """
+    xs, ys = _column_profile(floor)
+    n = len(xs)
+    if n < 30:
+        return None
+    cum = {key: np.concatenate([[0.0], np.cumsum(vals)])
+           for key, vals in (("x", xs), ("y", ys), ("xx", xs * xs), ("xy", xs * ys))}
+    best = None
+    for i in range(8, n - 8):
+        a = _seg_fit(xs, ys, cum, 0, i)
+        b = _seg_fit(xs, ys, cum, i, n)
+        if a is None or b is None:
+            continue
+        # Средний |остаток| по ВСЕМ точкам - сравнимо с фронтальной моделью.
+        err = (a[2] * i + b[2] * (n - i)) / n
+        if best is None or err < best[0]:
+            best = (err, a, b)
+    if best is None:
+        return None
+    err, (kl, bl, _), (kr, br, _) = best
+    if abs(kl - kr) < 1e-9:
+        return None
+    x_edge = (br - bl) / (kl - kr)
+    corner_x = x_edge / GRID_W
+    if not (CORNER_X_MIN <= corner_x <= CORNER_X_MAX):
+        return None
+    return corner_x, float(err), {"left": (kl, bl), "right": (kr, br)}
+
+
+def classify_floor_geometry(seg_text: str):
+    """Тип кадра из геометрии пола: ('frontal'|'corner', err, деталь) или None.
+
+    Обе модели соревнуются на одном профиле верхней границы маски пола:
+    фронтальная (3 сегмента, скат-горизонталь-скат) против угловой (2 сегмента
+    с изломом-ребром). Угловая побеждает, только если точнее с запасом
+    CORNER_FIT_ADVANTAGE - фронтальные кадры не должны уезжать в «угол» из-за
+    шума. Работает надёжно на пустых комнатах (declutter-предшаг); на обжитых
+    мебель рушит обе модели - тогда None и решают другие сигналы.
+    """
+    items = parse_segmentation(seg_text)
+    if not items:
+        return None
+    floor_item = next((i for i in items
+                       if "floor" in str(i.get("label", "")).lower()), None)
+    floor = mask_to_grid(floor_item) if floor_item else None
+    if floor is None:
+        return None
+    frontal = floor_support(floor)
+    corner = floor_support_corner(floor)
+    frontal_err = None
+    if frontal is not None:
+        # err фронтальной - сумма средних трёх сегментов; приводим к среднему
+        # по точкам тем же способом (сегменты почти равнодлинные - деление на 3).
+        frontal_err = frontal[1] / 3.0
+    if corner is not None and corner[1] <= MAX_FIT_ERR_PX and (
+            frontal_err is None or corner[1] * CORNER_FIT_ADVANTAGE < frontal_err):
+        return ("corner", corner[1], {"corner_x": round(corner[0], 3),
+                                      "lines": corner[2]})
+    if frontal is not None and frontal[1] <= MAX_FIT_ERR_PX:
+        return ("frontal", frontal[1], {"pts": frontal[0], "lines": frontal[2]})
+    return None
+
+
 def _opening_ground(mask: np.ndarray, lines: dict):
     """Стена проёма + точки его косяков на линии плинтуса + флаг обрезки."""
     ys, xs = np.where(mask)

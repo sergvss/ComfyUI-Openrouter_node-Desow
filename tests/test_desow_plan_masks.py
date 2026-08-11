@@ -351,6 +351,30 @@ def test_camera_probe_softened_without_floor_support():
     assert "смягчена" in debug
 
 
+def test_corner_fit_finds_edge():
+    from desow_plan.masks import classify_floor_geometry, floor_support_corner
+
+    # Кадр «в угол»: горизонтальный плинтус слева + скат справа, излом на 0.7
+    # (геометрия пустой гостиной declutter-эксперимента, разметка пользователя).
+    ys = np.arange(GRID_H)[:, None]
+    xs = np.arange(GRID_W)[None, :]
+    top = np.where(xs < 840, 500, 500 + 0.65 * (xs - 840))
+    corner_floor = (ys >= top).astype(np.uint8)
+    r = floor_support_corner(mask_to_grid(_png_item("the floor", corner_floor)))
+    assert r is not None
+    corner_x, err, _lines = r
+    assert corner_x == pytest.approx(0.7, abs=0.02)
+    assert err < 3.0
+    # Классификатор выбирает угловую модель на этом профиле...
+    mode, _err, detail = classify_floor_geometry(
+        seg_text([_png_item("the floor", corner_floor)]))
+    assert mode == "corner" and detail["corner_x"] == pytest.approx(0.7, abs=0.02)
+    # ...и фронтальную - на фронтальном (не уезжает в угол из-за шума).
+    mode2, _e2, _d2 = classify_floor_geometry(
+        seg_text([_png_item("the floor", synth_floor())]))
+    assert mode2 == "frontal"
+
+
 def test_composition_not_changed_by_masks():
     # Сегмент без пары в экстракции состав НЕ пополняет.
     items = [_png_item("the floor", synth_floor()),
