@@ -23,6 +23,9 @@ EXPECTED_WIDGETS = [
     "system_prompt", "user_message_box", "model", "web_search", "cheapest",
     "fastest", "seed", "temperature", "pdf_engine", "chat_mode", "max_retries",
     "fail_soft",
+    # append-only: гейт пропуска (скан, «комната уже пустая») - виджет строго
+    # ПОСЛЕ fail_soft; gate_text - forceInput-сокет, в виджеты не входит.
+    "gate_skip_value",
 ]
 WIDGET_TYPES = {"STRING", "INT", "FLOAT", "BOOLEAN"}
 

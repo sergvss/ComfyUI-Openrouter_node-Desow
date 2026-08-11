@@ -150,6 +150,11 @@ class OpenRouterNode:
                 # segments не должен уносить с собой скан, за который платит юзер.
                 # Дефолт False — прежнее fail-loud поведение для всех воркфлоу.
                 "fail_soft": ("BOOLEAN", {"default": False}),
+                # Гейт пропуска: текст-вход сравнивается со значением-виджетом
+                # (trim+lower); совпадение = API не вызывается, image_1 идёт
+                # насквозь. Виджет добавлен ПОСЛЕ fail_soft (append-only).
+                "gate_text": ("STRING", {"forceInput": True}),
+                "gate_skip_value": ("STRING", {"default": ""}),
             }
         }
 
@@ -336,6 +341,10 @@ class OpenRouterNode:
         black = torch.zeros((1, side, side, 3), dtype=torch.float32)
         return (message, black, "", "", "", "")
 
+    # Маркер пропуска по гейту: потребители различают его по префиксу, как
+    # OPENROUTER_ERROR у мягкого отказа.
+    GATE_SKIP_PREFIX = "GATE_SKIPPED"
+
     def generate_response(self, system_prompt, user_message_box, model,
                          web_search, cheapest, fastest, seed, temperature, pdf_engine, chat_mode,
                          max_retries=3,
@@ -343,13 +352,28 @@ class OpenRouterNode:
                          pdf_data=None, user_message_input=None,
                          image_1=None, image_2=None, image_3=None, image_4=None, image_5=None,
                          fail_soft=False,
+                         gate_text=None, gate_skip_value="",
                          **kwargs):
         """Точка входа ноды: при fail_soft=False — ровно прежнее поведение (raise).
 
         Мягкий отказ живёт здесь, а не внутри `_generate_response`, потому что
         часть терминальных ошибок (исчерпанные ретраи, отсутствующий ключ) летит
         мимо внутреннего try/except — ловить их надо одним местом на весь вызов.
+
+        Гейт: если `gate_text` (вход) после trim/lower совпал с `gate_skip_value`
+        (виджет) — API НЕ вызывается, нода отдаёт `image_1` как есть и маркер
+        GATE_SKIPPED в Output. Введён для мини-declutter скана: комната уже
+        пустая (проба ответила скип-значением) — генерация не нужна, дальше
+        по графу идёт оригинал кадра.
         """
+        if (gate_text is not None and str(gate_skip_value).strip()
+                and str(gate_text).strip().lower() == str(gate_skip_value).strip().lower()):
+            marker = "%s: %s" % (self.GATE_SKIP_PREFIX, str(gate_skip_value).strip())
+            print("[OpenRouter] %s — вызов пропущен, image_1 отдан как есть" % marker)
+            side = self.FAIL_SOFT_IMAGE_SIDE
+            passthrough = image_1 if image_1 is not None else torch.zeros(
+                (1, side, side, 3), dtype=torch.float32)
+            return (marker, passthrough, "", "", "", "")
         # Легаси-сдвиг виджетов двигает и fail_soft: он получает значение
         # max_retries старого графа (int 3 -> True). Мягкий отказ не должен
         # включаться сам по себе, поэтому гасим его на том же признаке, по
