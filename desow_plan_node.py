@@ -61,6 +61,9 @@ class DesowPlanRender:
                 # масочная опора перемеряет offset/width проёмов геометрией
                 # (см. desow_plan/masks.py). Пустая строка — шаг пропускается.
                 "segmentation_json": ("STRING", {"forceInput": True}),
+                # Ответ VLM-пробы конфигурации кадра (frontal|corner+corner_x):
+                # третий голос каскада диагностики диагонального кадра.
+                "corner_probe_json": ("STRING", {"forceInput": True}),
             },
         }
 
@@ -76,13 +79,14 @@ class DesowPlanRender:
 
     def render(self, extraction_json, scanner_openings_json="", room_type="",
                camera_probe_json="", camera_probe2_json="",
-               extraction2_json="", extraction3_json="", segmentation_json=""):
+               extraction2_json="", extraction3_json="", segmentation_json="",
+               corner_probe_json=""):
         try:
             png, plan_json, debug = build_empty_plan(
                 extraction_json, scanner_openings_json or "", (room_type or "").strip(),
                 camera_probe_json or "", camera_probe2_json or "",
                 extraction2_json or "", extraction3_json or "",
-                segmentation_json or "",
+                segmentation_json or "", corner_probe_json or "",
             )
         except Exception as exc:
             # Страховка на непредвиденное: ожидаемые сбои конвейер разбирает сам,

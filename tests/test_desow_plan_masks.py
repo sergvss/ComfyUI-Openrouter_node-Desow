@@ -375,6 +375,33 @@ def test_corner_fit_finds_edge():
     assert mode2 == "frontal"
 
 
+def test_resolve_frame_mode_cascade():
+    from desow_plan.masks import resolve_frame_mode
+
+    # 1) Геометрия пола - сильный голос: угловой профиль -> corner из геометрии.
+    ys = np.arange(GRID_H)[:, None]
+    xs = np.arange(GRID_W)[None, :]
+    top = np.where(xs < 840, 500, 500 + 0.65 * (xs - 840))
+    corner_seg = seg_text([_png_item("the floor", (ys >= top).astype(np.uint8))])
+    mode, side, source, cx = resolve_frame_mode(corner_seg)
+    assert (mode, side, source) == ("corner", "left", "геометрия пола")
+    assert cx == pytest.approx(0.7, abs=0.02)
+    # 2) Фронтальная геометрия + уверенная corner-проба: геометрия сказала
+    # frontal - режим фронтальный, проба НЕ перебивает явный фронтал...
+    frontal_seg = seg_text([_png_item("the floor", synth_floor())])
+    probe = json.dumps({"framing": "corner", "corner_x": 0.6, "confidence": 0.95})
+    assert resolve_frame_mode(frontal_seg, probe)[0] == "frontal"
+    # 3) ...а вот при вырожденной геометрии (нет опоры) проба решает.
+    rng = np.random.default_rng(7)
+    wave = 320 + 90 * np.sin(xs / 90.0) + rng.normal(0, 18, (1, GRID_W))
+    noisy_seg = seg_text([_png_item("the floor", (ys >= wave).astype(np.uint8))])
+    mode3 = resolve_frame_mode(noisy_seg, probe)
+    assert mode3 == ("corner", "left", "vlm-проба", 0.6)
+    # Неуверенная проба (conf < 0.9) не включает режим.
+    weak = json.dumps({"framing": "corner", "corner_x": 0.6, "confidence": 0.7})
+    assert resolve_frame_mode(noisy_seg, weak) is None
+
+
 def test_composition_not_changed_by_masks():
     # Сегмент без пары в экстракции состав НЕ пополняет.
     items = [_png_item("the floor", synth_floor()),

@@ -395,6 +395,73 @@ def support_is_reliable(seg_text: str) -> bool:
     return sup is not None and sup[1] <= MAX_FIT_ERR_PX
 
 
+# Минимальная уверенность VLM-пробы конфигурации кадра, чтобы её «corner»
+# включил диагональный режим без подтверждения геометрией.
+CORNER_PROBE_MIN_CONF = 0.9
+
+
+def parse_corner_probe(text: str):
+    """Ответ пробы конфигурации кадра: {framing, corner_x, confidence} | None."""
+    if not text:
+        return None
+    import re as _re
+    m = _re.search(r"\{.*\}", text, _re.S)
+    if not m:
+        return None
+    try:
+        data = json.loads(m.group(0), strict=False)
+    except (ValueError, TypeError):
+        return None
+    return data if isinstance(data, dict) and data.get("framing") in ("frontal", "corner") else None
+
+
+def resolve_frame_mode(seg_text: str, corner_probe_text: str = ""):
+    """Каскад диагностики кадра: (режим, сторона, источник, corner_x|None).
+
+    Голоса по силе (замеры 2026-08-11, пустые версии + бенч 18):
+    1. ГЕОМЕТРИЯ пола (classify_floor_geometry): жёсткие скаты не обманешь -
+       ловит углы с сильной перспективой (пустая гостиная corner_x=0.713).
+    2. Маски стен (diagnose_diagonal): исторический детектор, работает на
+       ярко выраженных углах без declutter (frame16).
+    3. VLM-проба конфигурации (v2): ловит «мягкие» углы, где геометрия
+       вырождена (пустая спальня v85: corner_x=0.65 conf 0.98); в счёт идёт
+       только уверенное corner (>= CORNER_PROBE_MIN_CONF).
+    Сторона камеры из corner_x: ребро в правой половине кадра -> камера у
+    левого края (все четыре угловых эталона: 0.58-0.71 -> left, совпадает
+    со скетчами пользователя).
+    """
+    geo = classify_floor_geometry(seg_text)
+    if geo is not None and geo[0] == "corner":
+        cx = geo[2]["corner_x"]
+        return ("corner", "left" if cx >= 0.5 else "right", "геометрия пола", cx)
+    # «Сильный» фронтал - оба боковых ската выражены и сходятся: такой вердикт
+    # закрывает вопрос, проба его не перебивает (12 фронтальных бенча). «Мягкий»
+    # (вырожденные наклоны - пустая спальня v85: -0.12/0.07) - слово за пробой.
+    if geo is not None and geo[0] == "frontal":
+        kl = geo[2]["lines"]["left"][0]
+        kb = geo[2]["lines"]["back"][0]
+        kr = geo[2]["lines"]["right"][0]
+        # Сильный фронтал: выраженные сходящиеся боковые скаты И горизонтальный
+        # back-плинтус (V-профиль без горизонтали - это угол, не фронтал).
+        if kl < -0.2 and kr > 0.2 and abs(kb) <= DIAG_BACK_SLOPE:
+            return ("frontal", None, "геометрия пола", None)
+    walls = diagnose_diagonal(seg_text)
+    if walls:
+        return ("corner", walls, "маски стен", None)
+    probe = parse_corner_probe(corner_probe_text)
+    if probe and probe.get("framing") == "corner":
+        try:
+            conf = float(probe.get("confidence") or 0)
+            cx = float(probe.get("corner_x")) if probe.get("corner_x") is not None else None
+        except (TypeError, ValueError):
+            conf, cx = 0.0, None
+        if conf >= CORNER_PROBE_MIN_CONF and cx is not None:
+            return ("corner", "left" if cx >= 0.5 else "right", "vlm-проба", cx)
+    if geo is not None:
+        return ("frontal", None, "геометрия пола (мягкий)", None)
+    return None
+
+
 def measure_openings_from_masks(seg_text: str, plan: dict) -> list[str]:
     """Перемеряет offset/width проёмов плана по маскам сегментации.
 

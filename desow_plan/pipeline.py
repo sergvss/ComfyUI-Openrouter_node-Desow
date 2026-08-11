@@ -26,7 +26,7 @@ from .gate import (
     resolve_opening_conflicts,
     snap_front_door_to_camera,
 )
-from .masks import diagnose_diagonal, measure_openings_from_masks, support_is_reliable
+from .masks import measure_openings_from_masks, resolve_frame_mode, support_is_reliable
 from .merge import (
     median_extractions,
     merge_with_scanner,
@@ -145,7 +145,7 @@ def resolve_camera_position(extractor_pos, primary, secondary,
 def build_empty_plan(extraction_json, scanner_openings_json="", room_type="",
                      camera_probe_json="", camera_probe2_json="",
                      extraction2_json="", extraction3_json="",
-                     segmentation_json=""):
+                     segmentation_json="", corner_probe_json=""):
     """`(png_bytes, plan_json, debug)` по ответу экстрактора и проёмам сканера.
 
     `plan_json` — компактный канонический план ПОСЛЕ мержа и гейта; при сбое
@@ -209,10 +209,20 @@ def build_empty_plan(extraction_json, scanner_openings_json="", room_type="",
                 debug.append("masks: %s" % note)
             # Диагональный кадр (съёмка в угол, видны 2 стены из 4): отдельный
             # режим камеры и двери - эвристики фронтального кадра здесь лгут.
-            diagonal_side = diagnose_diagonal(segmentation_json)
-            if diagonal_side:
-                debug.append("masks: диагональный кадр, невидимая боковая - %s"
-                             % diagonal_side)
+            # Каскад: геометрия пола -> маски стен -> VLM-проба конфигурации.
+            frame_mode = resolve_frame_mode(segmentation_json, corner_probe_json or "")
+            if frame_mode and frame_mode[0] == "corner":
+                diagonal_side = frame_mode[1]
+                debug.append("masks: диагональный кадр (%s%s), невидимая боковая - %s"
+                             % (frame_mode[2],
+                                ", ребро x=%.2f" % frame_mode[3] if frame_mode[3] else "",
+                                diagonal_side))
+                # Фильтр эркера: «отсутствующая» стена с проёмами экстрактора -
+                # не отсутствует (стеклянная стена читается как ребро, frame15).
+                if any(op.get("wall") == diagonal_side for op in plan.get("openings") or []):
+                    debug.append("masks: на «отсутствующей» стене есть проёмы - "
+                                 "диагональный режим отменён")
+                    diagonal_side = None
         except Exception as exc:  # noqa: BLE001 - масочный слой не роняет план
             debug.append("masks: ОШИБКА %s: %s (пропуск)" % (exc.__class__.__name__, exc))
 
