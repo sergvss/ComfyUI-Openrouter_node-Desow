@@ -290,6 +290,23 @@ def diagnose_diagonal(seg_text: str):
     return None
 
 
+def support_is_reliable(seg_text: str) -> bool:
+    """Построилась ли масочная опора пола (фит трёх плинтусов в допуске).
+
+    Сигнал для камеры: на обжитых интерьерах мебель закрывает плинтусы, опора
+    отказывает - геометрической страховки нет, и слабым решениям LLM-проб
+    доверять стоит меньше (A/B кухня: проба 0.62 против истины ~0.5).
+    """
+    items = parse_segmentation(seg_text)
+    if not items:
+        return False
+    floor_item = next((i for i in items
+                       if "floor" in str(i.get("label", "")).lower()), None)
+    floor = mask_to_grid(floor_item) if floor_item else None
+    sup = floor_support(floor) if floor is not None else None
+    return sup is not None and sup[1] <= MAX_FIT_ERR_PX
+
+
 def measure_openings_from_masks(seg_text: str, plan: dict) -> list[str]:
     """Перемеряет offset/width проёмов плана по маскам сегментации.
 

@@ -315,6 +315,42 @@ def test_diagonal_mode_unseals_the_unseen_wall():
     assert "left" not in (plan.get("solid_walls") or [])
 
 
+def test_camera_probe_softened_without_floor_support():
+    # A/B кухня 2026-08-11: опора отказала (мебель), проба 0.62 без спора с
+    # экстрактором 0.45 тянула камеру вправо при истине ~0.5. Без опоры слабое
+    # решение усредняется; среднее 0.535 попадает под снап к центру -> 0.5.
+    from desow_plan import build_empty_plan
+    from desow_plan.pipeline import resolve_camera_position
+
+    pos, why = resolve_camera_position(0.45, 0.62, None, support_ok=False)
+    assert pos == pytest.approx(0.535)
+    assert "смягчена" in why
+    # С построенной опорой поведение прежнее - эталон бенча не задет.
+    assert resolve_camera_position(0.45, 0.62, None, support_ok=True) == (0.62, "первичная проба")
+    # Сильная ветка «пробы согласны против экстрактора» не смягчается.
+    pos2, why2 = resolve_camera_position(0.2, 0.62, 0.6, support_ok=False)
+    assert pos2 == 0.62 and "согласны" in why2
+
+    # Интеграционно: шумный пол (опора не строится) + проба без спора.
+    rng = np.random.default_rng(7)
+    ys = np.arange(GRID_H)[:, None]
+    xs = np.arange(GRID_W)[None, :]
+    wave = 320 + 90 * np.sin(xs / 90.0) + rng.normal(0, 18, (1, GRID_W))
+    noisy = [_png_item("the floor", (ys >= wave).astype(np.uint8))]
+    extraction = json.dumps({
+        "room": {"shape": "rectangle", "width_dw": 5.6, "depth_dw": 5.0},
+        "openings": [{"type": "window", "wall": "back", "offset_dw": 4.0, "width_dw": 1.5}],
+        "camera": {"position": 0.45},
+    })
+    _png, plan_json, debug = build_empty_plan(
+        extraction, "", "kitchen",
+        json.dumps({"reason": "x", "position": 0.62}), "", "", "",
+        seg_text(noisy))
+    plan = json.loads(plan_json)
+    assert plan["camera"]["position"] == pytest.approx(0.5)   # среднее + снап
+    assert "смягчена" in debug
+
+
 def test_composition_not_changed_by_masks():
     # Сегмент без пары в экстракции состав НЕ пополняет.
     items = [_png_item("the floor", synth_floor()),

@@ -26,7 +26,7 @@ from .gate import (
     resolve_opening_conflicts,
     snap_front_door_to_camera,
 )
-from .masks import diagnose_diagonal, measure_openings_from_masks
+from .masks import diagnose_diagonal, measure_openings_from_masks, support_is_reliable
 from .merge import (
     median_extractions,
     merge_with_scanner,
@@ -106,7 +106,8 @@ CAMERA_CENTER_SNAP = 0.10      # почти-центр (0.40..0.60) прижим
 # и прямо» + гомографический решатель 0.504 против кривого ручного замера 0.754).
 
 
-def resolve_camera_position(extractor_pos, primary, secondary) -> tuple[float | None, str]:
+def resolve_camera_position(extractor_pos, primary, secondary,
+                            support_ok: bool = True) -> tuple[float | None, str]:
     """Консенсус позиций камеры: (значение | None, объяснение для debug).
 
     Первичная проба (1Мп) точнее всех поодиночке (эталон: |Δ| 0.085 против
@@ -122,6 +123,15 @@ def resolve_camera_position(extractor_pos, primary, secondary) -> tuple[float | 
         return (secondary, "первичной пробы нет, арбитр") if secondary is not None \
             else (None, "проб нет, позиция экстрактора")
     if extractor_pos is None or abs(primary - extractor_pos) <= PROBE_VS_EXTRACTOR_TOL:
+        # Слабое решение (проба без спора): на обжитом интерьере, где масочная
+        # опора пола не построилась (мебель закрыла плинтусы), геометрической
+        # страховки нет - пробу смягчаем экстрактором (A/B кухня 2026-08-11:
+        # проба 0.62 при истине ~0.5, экстрактор давал 0.45; среднее + снап к
+        # центру попадает). Эталон бенча не задет: там опора строится, и
+        # сильные ветки каскада ниже сохраняют прежнее поведение.
+        if not support_ok and extractor_pos is not None:
+            return ((primary + extractor_pos) / 2,
+                    "первичная проба, смягчена экстрактором (опоры пола нет)")
         return primary, "первичная проба"
     if secondary is None:
         return primary, "спор с экстрактором, арбитра нет — первичная проба"
@@ -191,8 +201,10 @@ def build_empty_plan(extraction_json, scanner_openings_json="", room_type="",
     # сегментации (измерение вместо мнения). До мержа и поворота: работаем в
     # исходной системе фото, состав не трогаем.
     diagonal_side = None
+    floor_support_ok = True
     if segmentation_json:
         try:
+            floor_support_ok = support_is_reliable(segmentation_json)
             for note in measure_openings_from_masks(segmentation_json, plan):
                 debug.append("masks: %s" % note)
             # Диагональный кадр (съёмка в угол, видны 2 стены из 4): отдельный
@@ -223,7 +235,8 @@ def build_empty_plan(extraction_json, scanner_openings_json="", room_type="",
     elif camera_probe_json or camera_probe2_json:
         old = plan.get("camera", {}).get("position")
         resolved, why = resolve_camera_position(
-            old, _probe_position(camera_probe_json), _probe_position(camera_probe2_json))
+            old, _probe_position(camera_probe_json), _probe_position(camera_probe2_json),
+            support_ok=floor_support_ok)
         if resolved is not None and abs(resolved - (old or -1)) > 1e-9:
             plan.setdefault("camera", {})["position"] = round(resolved, 3)
             debug.append("camera_probe: позиция %s -> %.2f (%s)" % (old, resolved, why))
