@@ -140,3 +140,13 @@ def test_global_threshold_cuts_single_vote():
     runs_texts = [txt([det("Vase", 600, 80, 700, 150)]), txt([]), txt([])]
     payload, _notes = encode_objects(runs_texts, 1000, 1000)
     assert payload["objects"] == []
+
+
+def test_gate_skipped_detections_give_clean_empty_result():
+    # Гейт пустой комнаты: все детекции пропущены нодой - опись пустая с
+    # честной пометкой, а не «нечитаемый ответ».
+    payload, notes = encode_objects(
+        ["GATE_SKIPPED: empty", "GATE_SKIPPED: empty", "GATE_SKIPPED: empty"],
+        1000, 800)
+    assert payload["objects"] == []
+    assert notes == ["гейт: комната пустая - детекция объектов пропущена"]

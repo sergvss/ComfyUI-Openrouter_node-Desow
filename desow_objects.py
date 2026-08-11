@@ -239,6 +239,14 @@ def encode_objects(detection_texts: list, image_w: int, image_h: int,
     """
     notes = []
     runs = []
+    # Гейт пустой комнаты: детекции пропущены нодой (маркер GATE_SKIPPED) -
+    # опись честно пустая, без пометок «нечитаемый ответ».
+    if detection_texts and all(
+            isinstance(t, str) and t.strip().startswith("GATE_SKIPPED")
+            for t in detection_texts if t):
+        return ({"version": 1, "image_w": int(image_w), "image_h": int(image_h),
+                 "image_hash": image_hash, "id_grid": ID_GRID, "objects": []},
+                ["гейт: комната пустая - детекция объектов пропущена"])
     for idx, text in enumerate(detection_texts):
         dets = parse_detections(text)
         if dets is None:

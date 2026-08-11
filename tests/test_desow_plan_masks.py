@@ -410,3 +410,30 @@ def test_composition_not_changed_by_masks():
     plan = base_plan([{"type": "door", "wall": "left", "offset_dw": 2.0, "width_dw": 0.9}])
     measure_openings_from_masks(seg_text(items), plan)
     assert len(plan["openings"]) == 1
+
+
+def test_diagonal_mode_reassigns_wall_from_segmentation():
+    # Кухня v88: экстрактор назвал окно back, сегментация пустой версии -
+    # «window on the right wall»; в диагональном режиме стена берётся из неё.
+    from desow_plan.masks import reassign_walls_from_segmentation
+
+    plan = {"openings": [
+        {"type": "window", "wall": "back", "offset_dw": 4.0, "width_dw": 1.5},
+        {"type": "door", "wall": "front", "offset_dw": 2.0, "width_dw": 1.0},
+    ]}
+    seg = seg_text([
+        _png_item("the floor", synth_floor()),
+        _png_item("window on the right wall", rect_mask(1000, 1101, 200, 400)),
+    ])
+    notes = reassign_walls_from_segmentation(seg, plan)
+    assert notes and "window back -> right" in notes[0]
+    assert plan["openings"][0]["wall"] == "right"
+    assert plan["openings"][1]["wall"] == "front"     # дверь не тронута
+    # Двусмысленность (окна на разных стенах в сегментации) - не переставляем.
+    seg2 = seg_text([
+        _png_item("window on the right wall", rect_mask(1000, 1101, 200, 400)),
+        _png_item("window on the left wall", rect_mask(100, 201, 200, 400)),
+    ])
+    plan2 = {"openings": [{"type": "window", "wall": "back", "offset_dw": 1.0, "width_dw": 1.0}]}
+    assert reassign_walls_from_segmentation(seg2, plan2) == []
+    assert plan2["openings"][0]["wall"] == "back"

@@ -26,7 +26,12 @@ from .gate import (
     resolve_opening_conflicts,
     snap_front_door_to_camera,
 )
-from .masks import measure_openings_from_masks, resolve_frame_mode, support_is_reliable
+from .masks import (
+    measure_openings_from_masks,
+    reassign_walls_from_segmentation,
+    resolve_frame_mode,
+    support_is_reliable,
+)
 from .merge import (
     median_extractions,
     merge_with_scanner,
@@ -223,6 +228,12 @@ def build_empty_plan(extraction_json, scanner_openings_json="", room_type="",
                     debug.append("masks: на «отсутствующей» стене есть проёмы - "
                                  "диагональный режим отменён")
                     diagonal_side = None
+                else:
+                    # На кадре «в угол» экстрактор путает стены проёмов
+                    # (кухня v88: окно у ребра названо back вместо right) -
+                    # стена берётся из лейбла сегментации пустой версии.
+                    for note in reassign_walls_from_segmentation(segmentation_json, plan):
+                        debug.append("masks: %s" % note)
         except Exception as exc:  # noqa: BLE001 - масочный слой не роняет план
             debug.append("masks: ОШИБКА %s: %s (пропуск)" % (exc.__class__.__name__, exc))
 

@@ -462,6 +462,43 @@ def resolve_frame_mode(seg_text: str, corner_probe_text: str = ""):
     return None
 
 
+def reassign_walls_from_segmentation(seg_text: str, plan: dict) -> list[str]:
+    """Диагональный кадр: стены проёмов - по лейблам сегментации пустой версии.
+
+    На кадре «в угол» экстрактор и сканер назначают стены в перекошенной
+    системе (кухня v88: окно у ребра названо back, тогда как сегментация по
+    пустой версии прямо говорит «window on the right wall»). Лейбл сегментации
+    здесь - самый честный источник: маска смотрит на конкретную стену.
+    Переставляем только когда тип совпал, а стена разошлась; состав не меняем.
+    """
+    items = parse_segmentation(seg_text)
+    if not items:
+        return []
+    seg_walls: dict = {}
+    for it in items:
+        lab = str(it.get("label", "")).lower()
+        kind = ("door" if "door" in lab else "window" if "window" in lab
+                else "passage" if "passage" in lab else None)
+        wall = ("left" if "left" in lab else "right" if "right" in lab
+                else "back" if "back" in lab else None)
+        if kind and wall:
+            seg_walls.setdefault(kind, []).append(wall)
+    kind_of = {"door": "door", "double_door": "door", "balcony_door": "door",
+               "window": "window", "floor_to_ceiling_window": "window",
+               "passage": "passage"}
+    notes = []
+    for op in plan.get("openings") or []:
+        kind = kind_of.get(op.get("type"))
+        walls = seg_walls.get(kind or "", [])
+        if not walls:
+            continue
+        if op.get("wall") not in walls and len(set(walls)) == 1:
+            notes.append("diag_wall: %s %s -> %s (стена из сегментации)"
+                         % (op.get("type"), op.get("wall"), walls[0]))
+            op["wall"] = walls[0]
+    return notes
+
+
 def measure_openings_from_masks(seg_text: str, plan: dict) -> list[str]:
     """Перемеряет offset/width проёмов плана по маскам сегментации.
 
