@@ -292,6 +292,29 @@ def test_diagonal_mode_places_camera_and_door():
     assert door["offset_dw"] == pytest.approx(MIN_CORNER_CLEARANCE_DW + 0.5, abs=1e-3)
 
 
+def test_diagonal_mode_unseals_the_unseen_wall():
+    # Экстрактор назвал невидимую боковую глухой - на диагональном кадре это
+    # гадание (стены нет в кадре): метка снимается, окно встаёт напротив входа
+    # (боевой прогон v86: solid_walls=['left'] уводил окно на front).
+    from desow_plan import build_empty_plan
+
+    extraction = json.dumps({
+        "room": {"shape": "rectangle", "width_dw": 4.2, "depth_dw": 4.8},
+        "openings": [{"type": "door", "wall": "right", "offset_dw": 2.4,
+                      "width_dw": 1.0,
+                      "swing": {"hinge": "back", "direction": "in"}}],
+        "camera": {"position": 0.55},
+        "solid_walls": ["left"],
+    })
+    _png, plan_json, debug = build_empty_plan(
+        extraction, "", "bedroom", "", "", "", "", seg_text(_diag_items()))
+    plan = json.loads(plan_json)
+    assert "solid_diag" in debug
+    window = next(o for o in plan["openings"] if o["type"] == "window")
+    assert window["wall"] == "left"
+    assert "left" not in (plan.get("solid_walls") or [])
+
+
 def test_composition_not_changed_by_masks():
     # Сегмент без пары в экстракции состав НЕ пополняет.
     items = [_png_item("the floor", synth_floor()),

@@ -214,6 +214,12 @@ def build_empty_plan(extraction_json, scanner_openings_json="", room_type="",
         plan.setdefault("camera", {})["position"] = corner
         debug.append("camera_diag: позиция %s -> %.2f (кадр в угол, пробы не в счёт)"
                      % (old, corner))
+        # Глухость невидимой боковой - гадание экстрактора (он её не видел);
+        # метка снимается, иначе гейт не поставит туда вставное окно (боевой
+        # прогон v86: solid_walls=['left'] увёл окно на front вместо left).
+        if diagonal_side in (plan.get("solid_walls") or ()):
+            plan["solid_walls"].remove(diagonal_side)
+            debug.append("solid_diag: %s не видна кадром - глухость снята" % diagonal_side)
     elif camera_probe_json or camera_probe2_json:
         old = plan.get("camera", {}).get("position")
         resolved, why = resolve_camera_position(
