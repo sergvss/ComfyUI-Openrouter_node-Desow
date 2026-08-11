@@ -9,12 +9,14 @@ import io
 import json
 
 import numpy as np
+import pytest
 from PIL import Image
 
 from desow_plan.masks import (
     GRID_H,
     GRID_W,
     build_floor_h_inv,
+    diagnose_diagonal,
     floor_support,
     floor_xy,
     mask_to_grid,
@@ -227,6 +229,67 @@ def test_match_tolerance_rejects_far_candidate():
     notes = measure_openings_from_masks(seg_text(items), plan)
     assert any("не сопоставлен" in n for n in notes)
     assert plan["openings"][1]["offset_dw"] == -1.1
+
+
+def synth_diag_floor():
+    """Пол кадра «в угол»: два ската без горизонтального back-сегмента."""
+    ys = np.arange(GRID_H)[:, None]
+    xs = np.arange(GRID_W)[None, :]
+    # Видимый угол на x=800: слева пологий скат вниз, справа крутой подъём.
+    top = np.where(xs < 800, 500 - 0.25 * xs, 300 + 0.55 * (xs - 800))
+    return (ys >= top).astype(np.uint8)
+
+
+def _diag_items():
+    # back-стена - два крошечных фрагмента, левой боковой почти нет.
+    return [
+        _png_item("the floor", synth_diag_floor()),
+        _png_item("the back wall", rect_mask(760, 830, 240, 380)),
+        _png_item("the back wall", rect_mask(600, 650, 300, 420)),
+        _png_item("the left wall", rect_mask(0, 60, 500, 700)),
+        _png_item("the right wall", rect_mask(830, 1200, 100, 700)),
+        _png_item("door on the right wall", rect_mask(860, 1000, 200, 560)),
+    ]
+
+
+def test_diagnose_diagonal_detects_corner_shot():
+    assert diagnose_diagonal(seg_text(_diag_items())) == "left"
+    # Фронтальная сцена (горизонтальный back-плинтус) - не диагональ.
+    frontal = [_png_item("the floor", synth_floor()),
+               _png_item("the back wall", rect_mask(300, 900, 100, 300)),
+               _png_item("the left wall", rect_mask(0, 300, 100, 600)),
+               _png_item("the right wall", rect_mask(900, 1200, 100, 600))]
+    assert diagnose_diagonal(seg_text(frontal)) is None
+    # Скат есть, но back-стена видна широко (зеркало/L-пол) - не диагональ.
+    trap = list(_diag_items())
+    trap[1] = _png_item("the back wall", rect_mask(200, 830, 150, 500))
+    assert diagnose_diagonal(seg_text(trap)) is None
+
+
+def test_diagonal_mode_places_camera_and_door():
+    from desow_plan import build_empty_plan
+    from desow_plan.schema_lite import MIN_CORNER_CLEARANCE_DW
+
+    extraction = json.dumps({
+        "room": {"shape": "rectangle", "width_dw": 4.2, "depth_dw": 4.8},
+        "openings": [{"type": "door", "wall": "right", "offset_dw": 2.4,
+                      "width_dw": 1.0,
+                      "swing": {"hinge": "back", "direction": "in"}}],
+        "camera": {"position": 0.55},
+    })
+    _png, plan_json, debug = build_empty_plan(
+        extraction, "", "bedroom",
+        # Пробы дают согласованно неверный 0.85 - в диагональном режиме они
+        # обязаны игнорироваться.
+        json.dumps({"reason": "x", "position": 0.85}),
+        json.dumps({"reason": "x", "position": 0.85}),
+        "", "", seg_text(_diag_items()))
+    plan = json.loads(plan_json)
+    assert "camera_diag" in debug and "door_diag" in debug
+    assert plan["camera"]["position"] == pytest.approx(0.1)
+    door = next(o for o in plan["openings"] if o["type"] == "door")
+    assert door["wall"] == "right"
+    assert door["offset_dw"] == pytest.approx(MIN_CORNER_CLEARANCE_DW + 0.5, abs=1e-3)
 
 
 def test_composition_not_changed_by_masks():

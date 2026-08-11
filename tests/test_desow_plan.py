@@ -784,16 +784,45 @@ def test_gate_leaves_the_front_wall_only_when_even_a_narrow_door_does_not_fit():
 
 
 def test_gate_inserts_window_on_front_by_default():
-    # Обе боковые без проходов: их видели в кадре (глухими) — окно на них
-    # противоречит фото (вердикт пользователя по fin380 «откуда появилось
+    # Боковых входов нет (вход на back): обе боковые видели в кадре — окно на
+    # них противоречит фото (вердикт пользователя по fin380 «откуда появилось
     # окно?»); наименее ложное место — невидимая front-стена.
-    plan = plan_with(openings=[{"type": "door", "wall": "left", "offset_dw": 1.0, "width_dw": 1.0}])
+    plan = plan_with(openings=[{"type": "door", "wall": "back", "offset_dw": 1.0, "width_dw": 1.0}])
     notes = ensure_door_and_window(plan)
     assert notes == ["window_inserted"]
     window = plan["openings"][-1]
     assert window["type"] == "window" and window["wall"] == "front"
     assert window["width_dw"] == 1.6
     assert_no_overlaps(plan, clearance=MIN_CORNER_CLEARANCE_DW)
+
+
+def test_gate_window_goes_opposite_a_side_door():
+    # Спальня v85 (вердикт пользователя + floorplan-expert): дверь жилой
+    # комнаты ведёт из коридора (внутренняя стена), наружная стена с окном —
+    # напротив. Правило распространено с прохода на всё семейство входов.
+    plan = plan_with(openings=[
+        {"type": "door", "wall": "right", "offset_dw": 1.2, "width_dw": 1.0,
+         "swing": {"hinge": "back", "direction": "in"}},
+    ])
+    notes = ensure_door_and_window(plan)
+    assert "window_inserted:left" in notes
+    window = next(o for o in plan["openings"] if o["type"] == "window")
+    assert window["wall"] == "left"
+
+
+def test_gate_window_avoids_the_solid_opposite_wall():
+    # Противоположная входу боковая объявлена глухой: видимая глухая стена с
+    # окном противоречит фото — сначала front, глухая остаётся крайним запасным.
+    plan = plan_with(
+        openings=[{"type": "door", "wall": "right", "offset_dw": 1.2, "width_dw": 1.0,
+                   "swing": {"hinge": "back", "direction": "in"}}],
+        solid_walls=["left"],
+    )
+    notes = ensure_door_and_window(plan)
+    assert "window_inserted" in notes
+    window = next(o for o in plan["openings"] if o["type"] == "window")
+    assert window["wall"] == "front"
+    assert plan["solid_walls"] == ["left"]     # глухость не тронута
 
 
 def test_gate_window_goes_opposite_a_side_passage():
@@ -810,10 +839,17 @@ def test_gate_window_goes_opposite_a_side_passage():
 
 
 def test_gate_window_unseals_the_solid_wall():
-    # Окно встало на стену из solid_walls: метка глухости снимается, иначе
-    # schema_lite при следующем парсе выбросит этот же проём как противоречие.
+    # Глухая противоположная стена — крайний запасной вариант: когда на front
+    # окну места нет (узкая комната, дверь в центре), окно всё же встаёт на
+    # глухую left, и метка глухости снимается — иначе schema_lite при следующем
+    # парсе выбросит этот же проём как противоречие.
     plan = plan_with(
-        openings=[{"type": "passage", "wall": "right", "offset_dw": 2.5, "width_dw": 1.0}],
+        room={"shape": "rectangle", "width_dw": 2.0, "depth_dw": 5.0},
+        openings=[
+            {"type": "passage", "wall": "right", "offset_dw": 2.5, "width_dw": 1.0},
+            {"type": "door", "wall": "front", "offset_dw": 1.0, "width_dw": 1.0,
+             "swing": {"hinge": "left", "direction": "in"}},
+        ],
         solid_walls=["left"],
     )
     notes = ensure_door_and_window(plan)

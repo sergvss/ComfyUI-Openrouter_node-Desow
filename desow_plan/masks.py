@@ -238,6 +238,58 @@ def _kind_from_label(label: str) -> str:
     return "passage"
 
 
+# Пороги детектора диагонального кадра (съёмка в угол комнаты, видны 2 стены
+# из 4). Калибровка по 15 кадрам бенча 18 (2026-08-11): честные фронтальные
+# (включая узкие пеналы fin379/fin380) не проходят ГЕОМЕТРИЧЕСКИЙ критерий;
+# ловушки (зеркало fin463/frame13, L-пол lroom) проходят его, но отсекаются
+# МАСОЧНЫМ (их back-стена видна широко). Оба критерия обязаны совпасть.
+DIAG_BACK_SLOPE = 0.12        # |наклон| среднего сегмента фита: горизонтали нет
+DIAG_SIDE_SLOPE_MIN = 0.05    # крайние сегменты «наклонены всерьёз» (не шум фита)
+DIAG_BACK_AREA_MAX = 0.08     # маска back-стены < 8% кадра (только у диагонали)
+DIAG_SIDE_AREA_MIN = 0.03     # одна из боковых < 3% кадра - её и не видно
+
+
+def diagnose_diagonal(seg_text: str):
+    """Детектор кадра «в угол»: None (не диагональ/нет данных) или сторона
+    невидимой боковой стены ('left'|'right') - камера стоит в углу с этой
+    стороны, взгляд по диагонали в видимый угол."""
+    items = parse_segmentation(seg_text)
+    if not items:
+        return None
+    floor_item = next((i for i in items
+                       if "floor" in str(i.get("label", "")).lower()), None)
+    floor = mask_to_grid(floor_item) if floor_item else None
+    sup = floor_support(floor) if floor is not None else None
+    if sup is None:
+        return None
+    _pts, _err, lines = sup
+    kl, kb, kr = lines["left"][0], lines["back"][0], lines["right"][0]
+    slanted = abs(kb) > DIAG_BACK_SLOPE or (
+        kl * kr > 0 and abs(kl) > DIAG_SIDE_SLOPE_MIN and abs(kr) > DIAG_SIDE_SLOPE_MIN)
+    if not slanted:
+        return None
+    area = {"back": 0.0, "left": 0.0, "right": 0.0}
+    for it in items:
+        lab = str(it.get("label", "")).lower()
+        # Только сегменты самих стен: «door on the right wall» тоже содержит
+        # слово wall, но это проём - в площадь стены не идёт.
+        if "wall" not in lab or any(w in lab for w in _OPENING_WORDS):
+            continue
+        side = ("back" if "back" in lab else "left" if "left" in lab
+                else "right" if "right" in lab else None)
+        if side:
+            m = mask_to_grid(it)
+            if m is not None:
+                area[side] += float(m.sum()) / (GRID_W * GRID_H)
+    if area["back"] >= DIAG_BACK_AREA_MAX:
+        return None
+    if area["left"] < DIAG_SIDE_AREA_MIN <= area["right"]:
+        return "left"
+    if area["right"] < DIAG_SIDE_AREA_MIN <= area["left"]:
+        return "right"
+    return None
+
+
 def measure_openings_from_masks(seg_text: str, plan: dict) -> list[str]:
     """Перемеряет offset/width проёмов плана по маскам сегментации.
 

@@ -26,7 +26,7 @@ from .gate import (
     resolve_opening_conflicts,
     snap_front_door_to_camera,
 )
-from .masks import measure_openings_from_masks
+from .masks import diagnose_diagonal, measure_openings_from_masks
 from .merge import (
     median_extractions,
     merge_with_scanner,
@@ -35,7 +35,12 @@ from .merge import (
 )
 from .render import CANVAS, PAGE, render_plan
 from .scanner import extract_json_object, parse_scanner_openings
-from .schema_lite import DW_M, PlanDataError, validate_plan
+from .schema_lite import (
+    DW_M,
+    MIN_CORNER_CLEARANCE_DW,
+    PlanDataError,
+    validate_plan,
+)
 
 
 def blank_png():
@@ -185,14 +190,31 @@ def build_empty_plan(extraction_json, scanner_openings_json="", room_type="",
     # 1б) Масочная опора: перемер offset/width проёмов геометрией по маскам
     # сегментации (измерение вместо мнения). До мержа и поворота: работаем в
     # исходной системе фото, состав не трогаем.
+    diagonal_side = None
     if segmentation_json:
         try:
             for note in measure_openings_from_masks(segmentation_json, plan):
                 debug.append("masks: %s" % note)
+            # Диагональный кадр (съёмка в угол, видны 2 стены из 4): отдельный
+            # режим камеры и двери - эвристики фронтального кадра здесь лгут.
+            diagonal_side = diagnose_diagonal(segmentation_json)
+            if diagonal_side:
+                debug.append("masks: диагональный кадр, невидимая боковая - %s"
+                             % diagonal_side)
         except Exception as exc:  # noqa: BLE001 - масочный слой не роняет план
             debug.append("masks: ОШИБКА %s: %s (пропуск)" % (exc.__class__.__name__, exc))
 
-    if camera_probe_json or camera_probe2_json:
+    if diagonal_side:
+        # Камера в углу со стороны невидимой стены, взгляд по диагонали в
+        # видимый угол (скетч пользователя, кадр frame16 бенча 18). Пробы и
+        # прижатие к центру пропускаются: их эвристика «какая стена шире
+        # видна» на диагональном ракурсе даёт согласованно неверный ответ.
+        old = plan.get("camera", {}).get("position")
+        corner = 0.1 if diagonal_side == "left" else 0.9
+        plan.setdefault("camera", {})["position"] = corner
+        debug.append("camera_diag: позиция %s -> %.2f (кадр в угол, пробы не в счёт)"
+                     % (old, corner))
+    elif camera_probe_json or camera_probe2_json:
         old = plan.get("camera", {}).get("position")
         resolved, why = resolve_camera_position(
             old, _probe_position(camera_probe_json), _probe_position(camera_probe2_json))
@@ -254,9 +276,16 @@ def build_empty_plan(extraction_json, scanner_openings_json="", room_type="",
     # деле боковая — размеры меняются местами, пассаж встаёт в её середину.
     # Строго ДО развода конфликтов — угловой пассаж иначе гибнет там как
     # «не влезающий».
-    corridor_notes = reorient_corridor_wall(plan)
-    if corridor_notes:
-        debug.append("corridor: %s" % ", ".join(corridor_notes))
+    # Диагональный кадр и коридорный поворот - взаимоисключающие сценарии
+    # (на бенче не пересекаются: коридорные кадры отсекает масочный критерий
+    # детектора). Гард на случай, если оба сработают на неизвестном кадре:
+    # диагноз по маскам надёжнее, и его правки идут в исходной системе стен.
+    if diagonal_side:
+        debug.append("corridor: пропущен (диагональный кадр)")
+    else:
+        corridor_notes = reorient_corridor_wall(plan)
+        if corridor_notes:
+            debug.append("corridor: %s" % ", ".join(corridor_notes))
 
     # 2в) Дверь экстрактора на невидимой front-стене — под камеру (offset там
     # всё равно догадка; снимают, как правило, от входа).
@@ -269,6 +298,21 @@ def build_empty_plan(extraction_json, scanner_openings_json="", room_type="",
     pier_notes = keep_side_front_pier(plan)
     if pier_notes:
         debug.append("side_pier: %s" % ", ".join(pier_notes))
+
+    # 2г-диаг) Кадр в угол: дверь видимой боковой стены прижимается к дальнему
+    # (back) углу с нормативным простенком - по архитектуре, а не по дрожащему
+    # офсету экстрактора (на диагональном ракурсе его система координат
+    # перекошена: тот же кадр давал 1.2 и 2.4 dw в разных прогонах).
+    if diagonal_side:
+        visible = "right" if diagonal_side == "left" else "left"
+        for op in plan["openings"]:
+            if op.get("wall") == visible and op.get("type") in ("door", "double_door"):
+                target = MIN_CORNER_CLEARANCE_DW + float(op["width_dw"]) / 2
+                if abs(float(op["offset_dw"]) - target) > 1e-9:
+                    debug.append("door_diag: %s/%s к back-углу %.2f -> %.2f"
+                                 % (op["type"], visible, float(op["offset_dw"]), target))
+                    op["offset_dw"] = round(target, 3)
+                break
 
     # 2д) Санитария ширин: проём уже физического минимума (дверь 0.7 м, окно
     # 0.3 м) расширяется до него — модель занизила, щели не бывает (fin424).
