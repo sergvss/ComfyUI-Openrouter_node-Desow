@@ -28,7 +28,9 @@ GLOBAL_THRESHOLD = 0.5
 DEDUP_IOU = 0.35
 SYNONYM_IOU = 0.7
 EXCLUSION_IOS = 0.7
-GLOBAL_MIN_BOX_PCT = 1.0
+# 1.0 -> 0.5 по приёмке A/B 2026-08-11: боксы Gemini в 3-4 раза плотнее масок
+# SAM3, и старая калибровка резала живые стулья (0.68-0.93% кадра).
+GLOBAL_MIN_BOX_PCT = 0.5
 ID_GRID = 8
 # Кластеризация ансамбля: та же граница совпадения, что в тесте эмуляции.
 ENSEMBLE_MATCH_IOU = 0.5
