@@ -266,3 +266,217 @@ def merge_with_scanner(scanner: dict, vlm_runs: list[dict]) -> tuple[dict, dict]
             meta["added_from_vlm"].append(k)
     base["openings"] = merged_ops
     return base, meta
+
+
+# ── медиана нескольких прогонов экстрактора ──────────────────────────
+
+# Проём другого прогона считается ТЕМ ЖЕ, если тип и стена совпали, а центры
+# ближе этого. Толеранс широкий сознательно: прогон-выброс уезжает на ~2 dw
+# (lroom: дверь 1.2 против 3.3/3.6), и он обязан попасть в медиану, чтобы быть
+# переголосованным — в том числе когда выбросом оказался БАЗОВЫЙ прогон.
+# Разные проёмы одного типа на одной стене разводит жадное 1:1-сопоставление
+# по ближайшему центру.
+SAME_OPENING_TOL_DW = 2.5
+
+
+def _median(values: list[float]) -> float:
+    ordered = sorted(values)
+    mid = len(ordered) // 2
+    return ordered[mid] if len(ordered) % 2 else (ordered[mid - 1] + ordered[mid]) / 2
+
+
+def median_extractions(plans: list[dict]) -> list[str]:
+    """Усредняет геометрию базового плана по нескольким прогонам экстрактора.
+
+    Одна экстракция недетерминирована даже при t=0/seed: размеры комнаты и
+    offset'ы видимых проёмов дрожат между прогонами на ±0.3-0.5 dw, а изредка
+    прогон-выброс уезжает на 1.5+ dw (кадр lroom: дверь 1.2 против 3.3 на одном
+    фото). Состав при этом стабилен. Лекарство — медиана: граф зовёт экстрактор
+    трижды (разные seed), состав берётся от базового прогона, а размеры комнаты
+    и offset/width каждого проёма — медианой по совпавшим прочтениям (тип+стена,
+    центры ближе SAME_OPENING_TOL_DW, соответствие 1:1). Медиана из трёх гасит
+    одиночный выброс полностью; из двух — хотя бы усредняет.
+
+    Мутирует ПЕРВЫЙ план списка (базовый), возвращает пометки для debug.
+    Прогоны с другой формой комнаты в медиану размеров не входят.
+    """
+    notes: list[str] = []
+    if len(plans) < 2:
+        return notes
+    base = plans[0]
+    base_room = base.get("room") or {}
+    for key in ("width_dw", "depth_dw"):
+        values = []
+        for plan in plans:
+            room = plan.get("room") or {}
+            if room.get("shape") == base_room.get("shape") and room.get(key) is not None:
+                values.append(float(room[key]))
+        if len(values) >= 2:
+            med = round(_median(values), 3)
+            if abs(med - float(base_room[key])) > 1e-9:
+                notes.append("room.%s %.2f->%.2f (медиана %d прогонов)"
+                             % (key, float(base_room[key]), med, len(values)))
+                base_room[key] = med
+
+    used: dict[int, set] = {i: set() for i in range(1, len(plans))}
+    for op in base.get("openings") or []:
+        try:
+            offsets = [float(op["offset_dw"])]
+            widths = [float(op["width_dw"])]
+        except (KeyError, TypeError, ValueError):
+            continue
+        for i, other in enumerate(plans[1:], start=1):
+            best, best_d = None, SAME_OPENING_TOL_DW
+            for cand in other.get("openings") or []:
+                if (cand.get("type") != op.get("type") or cand.get("wall") != op.get("wall")
+                        or id(cand) in used[i]):
+                    continue
+                try:
+                    d = abs(float(cand["offset_dw"]) - offsets[0])
+                except (KeyError, TypeError, ValueError):
+                    continue
+                if d <= best_d:
+                    best, best_d = cand, d
+            if best is not None:
+                used[i].add(id(best))
+                offsets.append(float(best["offset_dw"]))
+                widths.append(float(best["width_dw"]))
+        if len(offsets) >= 2:
+            new_offset = round(_median(offsets), 3)
+            if abs(new_offset - offsets[0]) > 1e-3:
+                notes.append("%s/%s offset %.2f->%.2f (медиана %d)"
+                             % (op.get("type"), op.get("wall"), offsets[0], new_offset,
+                                len(offsets)))
+            op["offset_dw"] = new_offset
+            op["width_dw"] = round(_median(widths), 3)
+    return notes
+
+
+# ── коридорная стена — боковая (поворот) ─────────────────────────────
+
+# Насколько далеко дальний косяк пассажа может отстоять от угла глухой стены,
+# чтобы всё ещё читаться «коридор начинается прямо в углу».
+CORRIDOR_CORNER_TOL_DW = 0.3
+# Дверь, чей косяк ближе этого к устью коридора, стоит в самом коридоре — по
+# фото она видна СКВОЗЬ проём и комнате не принадлежит (вердикт пользователя по
+# fin463: «этой двери нет в комнате, она в коридоре»). Вход в комнату при этом
+# остаётся — им становится сам пассаж. Допуск широкий: расстояние дверь-устье
+# дрожит между прогонами экстрактора на ±0.5 dw (контрольный прогон бенча 16
+# пропустил ту же дверь при 0.5), а настоящая дверь главной зоны стоит от устья
+# заметно дальше.
+CORRIDOR_DOOR_TOL_DW = 1.5
+
+
+def reorient_corridor_wall(plan: dict) -> list[str]:
+    """Коридор вдоль глухой (зеркальной) стены: стена с проёмами — боковая.
+
+    Паттерн кадра fin463: съёмка в угол. Колонна/пилястра на стыке склеивает
+    для VLM две плоскости в одну «back»-стену: туда попадают и проём коридора,
+    прижатый к углу глухой (зеркальной) стены, и дверь, которая на самом деле
+    стоит в коридоре. Разметка пользователя: большая пустая плоскость — это
+    back-стена комнаты, а стена с проёмами — БОКОВАЯ (вдоль неё уходит коридор),
+    то есть комната глубже, чем широка. Промптовое исполнение провалилось дважды
+    (модель не переносит проём со стены, где видит его плоскость, и путает
+    пересчёт камеры), поэтому преобразование делает код:
+
+    - триггер: rectangle + пассаж на back, чей дальний косяк ближе
+      CORRIDOR_CORNER_TOL_DW к углу глухой (solid_walls) боковой стены;
+    - width_dw и depth_dw меняются местами (стена с проёмами — боковая);
+    - пассаж встаёт в СЕРЕДИНУ этой боковой стены: точную глубину устья с фото
+      не измерить (стена уходит в перспективу, VLM сжимает её конец), середина —
+      наименее ложное утверждение (подтверждена двумя скетчами пользователя);
+    - дверь впритык к устью (ближе CORRIDOR_DOOR_TOL_DW) — коридорная,
+      выбрасывается; остальные проёмы старой back-стены переезжают на боковую
+      с тем же отсчётом от общего угла;
+    - глухость: старая противоположная боковая стена (большая пустая плоскость)
+      становится back и остаётся глухой; зеркальная метка снимается — её плоскость
+      после поворота не образует целой стены;
+    - camera.position сохраняется: смещение камеры к коридорной стороне по
+      смыслу то же на новой front-стене.
+
+    Сложные случаи поворот пропускает без изменений: проёмы на большой пустой
+    плоскости или на front, перегородки — там переотсчёт не однозначен, а плана
+    честнее не трогать. Вызывается ПОСЛЕ мержа (пассаж уже подтверждён составом)
+    и ДО развода конфликтов: угловой пассаж иначе гибнет там как «не влезающий».
+    Возвращает пометки для debug; пустой список = триггер не сработал.
+    """
+    room = plan.get("room") or {}
+    if room.get("shape") != "rectangle":
+        return []
+    solid = plan.get("solid_walls") or []
+    openings = plan.get("openings") or []
+    try:
+        width = float(room["width_dw"])
+        depth = float(room["depth_dw"])
+    except (KeyError, TypeError, ValueError):
+        return []
+
+    for side in ("right", "left"):
+        if side not in solid:
+            continue
+        far_wall = "left" if side == "right" else "right"   # большая пустая плоскость
+        corner = width if side == "right" else 0.0
+        for op in openings:
+            # Устье коридора модель читает то «passage», то «door» (прогоны
+            # бенча 16 дали оба варианта на одном фото) — тип здесь не признак:
+            # признак — проём-вход, прижатый к углу глухой (зеркальной) стены.
+            if op.get("type") not in ("passage", "door", "double_door") or op.get("wall") != "back":
+                continue
+            try:
+                offset = float(op["offset_dw"])
+                op_width = float(op["width_dw"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            if op_width >= width / 2:
+                continue   # проём в полстены — не устье коридора
+            far_jamb = offset + op_width / 2 if side == "right" else offset - op_width / 2
+            if abs(corner - far_jamb) > CORRIDOR_CORNER_TOL_DW:
+                continue
+            if plan.get("partitions"):
+                return []
+            if any(o.get("wall") in (far_wall, "front") for o in openings):
+                return []
+            # Отсчёт вдоль старой back-стены от ОБЩЕГО угла с коридорной стеной:
+            # для right-коридора это её левый угол (offset как есть), для left —
+            # правый (width - offset). Тот же угол — back-конец новой боковой
+            # стены, так что позиции переезжают без пересчёта системы координат.
+            def from_corner(x: float) -> float:
+                return x if side == "right" else width - x
+
+            notes = ["corridor_wall_to_side:%s, комната %.2fx%.2f -> %.2fx%.2f dw"
+                     % (side, width, depth, depth, width)]
+            room["width_dw"], room["depth_dw"] = round(depth, 3), round(width, 3)
+
+            kept: list[dict] = []
+            passage_jamb = from_corner(offset) - op_width / 2
+            for other in openings:
+                if other is op:
+                    continue
+                if other.get("wall") == "back":
+                    half = float(other.get("width_dw", 0)) / 2
+                    centre = from_corner(float(other.get("offset_dw", 0)))
+                    if (other.get("type") in ("door", "double_door")
+                            and passage_jamb - (centre + half) <= CORRIDOR_DOOR_TOL_DW):
+                        notes.append("corridor_door_dropped:%s/back" % other.get("type"))
+                        continue
+                    other["wall"] = side
+                    other["offset_dw"] = round(centre, 3)
+                kept.append(other)
+            # Устье — в середину новой боковой стены (её длина = старая width).
+            # Полотна у входа в коридор нет — тип нормализуется в passage.
+            if op.get("type") != "passage":
+                notes.append("corridor_mouth:%s->passage" % op.get("type"))
+                op["type"] = "passage"
+                op.pop("swing", None)
+            op["wall"] = side
+            op["offset_dw"] = round(width / 2, 3)
+            kept.append(op)
+            notes.append("passage_mid_side:%s %.2f" % (side, width / 2))
+            plan["openings"] = kept
+
+            new_solid = ["back"] if far_wall in solid else []
+            if side in solid:
+                notes.append("mirror_wall_dissolved:%s" % side)
+            plan["solid_walls"] = new_solid
+            return notes
+    return []

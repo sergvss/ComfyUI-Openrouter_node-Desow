@@ -29,6 +29,7 @@ A custom node for ComfyUI that allows you to interact with OpenRouter's API, pro
 | `desow_plan/geometry.py` | `plan2d/geometry.py` (различие: строка импорта) — общее размещение проёмов (`usable_spans` / `place_opening`) |
 | `desow_plan/merge.py` | пары нет: `plan2d/merge.py` удалён, мерж исполняет только граф |
 | `desow_plan/gate.py` | пары нет: `plan2d/gate.py` удалён, гейт исполняет только граф |
+| `desow_plan/masks.py` | пары нет: масочная опора (сегментация gemini-2.5) исполняется только графом |
 | `desow_plan/render.py` | `plan2d/render.py` (различие: строка импорта) |
 | `desow_plan/validate.py` | `plan2d/validate.py` (различие: строка импорта) — эргономика расстановки |
 | `desow_plan/furnish.py` | `plan2d/furnish.py` (промпт и цикл ре-промптов; отличия в шапке файла) |
@@ -44,10 +45,18 @@ A custom node for ComfyUI that allows you to interact with OpenRouter's API, pro
 Зависимости: только Pillow (уже в `requirements.txt`) плюс numpy/torch на конвертацию
 картинки в тензор — оба есть в любой сборке ComfyUI. Сети в ноде нет.
 
-### `DesowPlanRender`: выходы и маркер камеры
+### `DesowPlanRender`: входы, выходы и маркер камеры
 
-Выходы: `image`, `plan_json`, `debug`, `plan_camera`. Порядок — часть контракта
-графов (связи в JSON воркфлоу позиционные), новые выходы дописываются только в конец.
+Обязательный вход один — `extraction_json` (ответ VLM-экстрактора). Остальные
+опциональны, пустая строка выключает соответствующий шаг: `scanner_openings_json`
+(состав проёмов от детектора), `room_type` (сквозное поле), `camera_probe_json` /
+`camera_probe2_json` (консенсус-каскад позиции камеры), `extraction2_json` /
+`extraction3_json` (дубли экстрактора для медианы), `segmentation_json` (маски
+gemini-2.5 — перемер offset/width проёмов геометрией, см. `desow_plan/masks.py`).
+
+Выходы: `image`, `plan_json`, `debug`, `plan_camera`, `camera_json` (блок camera
+плана отдельной строкой). Порядок — часть контракта графов (связи в JSON воркфлоу
+позиционные), новые выходы дописываются только в конец.
 
 `image` — чистый трёхтоновый лист: на нём расставляется мебель, цветной пиксель там
 был бы помехой. `plan_camera` — тот же план плюс маркер точки съёмки: тёмный ромб у

@@ -19,8 +19,20 @@ import json
 from PIL import Image
 
 from .furnish import STYLE_HINT_LIMIT, FurnishError, place_furniture
-from .gate import ensure_door_and_window, resolve_opening_conflicts
-from .merge import merge_with_scanner, scanner_openings_from_scan
+from .gate import (
+    enforce_min_opening_widths,
+    ensure_door_and_window,
+    keep_side_front_pier,
+    resolve_opening_conflicts,
+    snap_front_door_to_camera,
+)
+from .masks import measure_openings_from_masks
+from .merge import (
+    median_extractions,
+    merge_with_scanner,
+    reorient_corridor_wall,
+    scanner_openings_from_scan,
+)
 from .render import CANVAS, PAGE, render_plan
 from .scanner import extract_json_object, parse_scanner_openings
 from .schema_lite import DW_M, PlanDataError, validate_plan
@@ -70,12 +82,75 @@ def _fmt_ops(openings):
     return "[%s]" % ", ".join("%s/%s" % (o.get("type"), o.get("wall")) for o in openings) if openings else "[]"
 
 
-def build_empty_plan(extraction_json, scanner_openings_json="", room_type=""):
+def _probe_position(text) -> float | None:
+    """Позиция 0..1 из ответа камера-пробы; None на мусоре/вне диапазона."""
+    if not text:
+        return None
+    try:
+        value = float(extract_json_object(text)["position"])
+    except (ValueError, TypeError, KeyError):
+        return None
+    return value if 0.0 <= value <= 1.0 else None
+
+
+# Пороги консенсус-каскада камера-проб (калибровка: полигон бенча 16).
+PROBE_VS_EXTRACTOR_TOL = 0.3   # проба «спорит» с экстрактором -> зовём арбитра
+PROBE_AGREEMENT_TOL = 0.25     # пробы согласны -> верим первичной
+CAMERA_CENTER_SNAP = 0.10      # почти-центр (0.40..0.60) прижимается к 0.5
+# Порог расширен 0.07 -> 0.10 по кадру kitchen (вердикт пользователя «по центру
+# и прямо» + гомографический решатель 0.504 против кривого ручного замера 0.754).
+
+
+def resolve_camera_position(extractor_pos, primary, secondary) -> tuple[float | None, str]:
+    """Консенсус позиций камеры: (значение | None, объяснение для debug).
+
+    Первичная проба (1Мп) точнее всех поодиночке (эталон: |Δ| 0.085 против
+    0.117 у экстрактора и 0.139 у 2Мп-пробы), но изредка перетягивает в край
+    (frame12: 0.75 при истинных ~0.35). Каскад: расходится с экстрактором
+    больше PROBE_VS_EXTRACTOR_TOL — спрашиваем арбитра (2Мп-проба); пробы
+    согласны между собой — правы пробы (экстрактор тянет к центру, fin463);
+    пробы разошлись — берём ту, что ближе к экстрактору. На эталонных кадрах
+    каскад совпадает с первичной пробой, менять его пороги — только с новым
+    замером по camera_gt.
+    """
+    if primary is None:
+        return (secondary, "первичной пробы нет, арбитр") if secondary is not None \
+            else (None, "проб нет, позиция экстрактора")
+    if extractor_pos is None or abs(primary - extractor_pos) <= PROBE_VS_EXTRACTOR_TOL:
+        return primary, "первичная проба"
+    if secondary is None:
+        return primary, "спор с экстрактором, арбитра нет — первичная проба"
+    if abs(primary - secondary) <= PROBE_AGREEMENT_TOL:
+        return primary, "пробы согласны против экстрактора"
+    if abs(secondary - extractor_pos) < abs(primary - extractor_pos):
+        return secondary, "пробы разошлись, арбитр ближе к экстрактору"
+    return primary, "пробы разошлись, первичная ближе к экстрактору"
+
+
+def build_empty_plan(extraction_json, scanner_openings_json="", room_type="",
+                     camera_probe_json="", camera_probe2_json="",
+                     extraction2_json="", extraction3_json="",
+                     segmentation_json=""):
     """`(png_bytes, plan_json, debug)` по ответу экстрактора и проёмам сканера.
 
     `plan_json` — компактный канонический план ПОСЛЕ мержа и гейта; при сбое
     пустая строка. `debug` — построчный отчёт: что разобрано, что дал сканер, что
     решил мерж, что вставил гейт, с каким масштабом отрисовано.
+
+    `camera_probe_json` / `camera_probe2_json` — ответы двух камера-проб графа
+    (1Мп и 2Мп-арбитр, `{"reason": ..., "position": 0..1}`): консенсус точнее
+    числа из большой экстракции и стабилен между прогонами
+    (`resolve_camera_position`). Пустые строки / мусор — остаётся экстракторская.
+
+    `extraction2_json` / `extraction3_json` — дублирующие прогоны экстрактора
+    (другие seed): состав берётся от первого, а размеры и позиции проёмов —
+    медианой совпавших прочтений (`median_extractions`), это гасит прогоны-
+    выбросы. Пустые строки / мусор — молча пропускаются.
+
+    `segmentation_json` — ответ сегментации (gemini-2.5-flash, маски пола/стен/
+    проёмов): масочная опора ПЕРЕМЕРЯЕТ offset/width проёмов геометрией
+    (`measure_openings_from_masks`) — измерение вместо мнения модели. Состав не
+    меняется; сбой любого шага откатывает проём на экстракторскую геометрию.
     """
     debug = []
 
@@ -91,6 +166,53 @@ def build_empty_plan(extraction_json, scanner_openings_json="", room_type=""):
     except PlanDataError as exc:
         debug.append("plan: ОШИБКА extract_invalid_schema: %s" % exc)
         return blank_png(), "", "\n".join(debug)
+
+    extra_plans = []
+    for label, extra_json in (("2", extraction2_json), ("3", extraction3_json)):
+        if not extra_json:
+            continue
+        try:
+            extra_plan, _notes = validate_plan(extract_json_object(extra_json))
+            extra_plans.append(extra_plan)
+        except (ValueError, TypeError, PlanDataError) as exc:
+            debug.append("extract%s: нечитаемый дубль, пропущен (%s)" % (label, exc))
+    if extra_plans:
+        med_notes = median_extractions([plan, *extra_plans])
+        debug.append("median: прогонов %d%s" % (
+            1 + len(extra_plans),
+            (", " + ", ".join(med_notes)) if med_notes else ", геометрия совпала"))
+
+    # 1б) Масочная опора: перемер offset/width проёмов геометрией по маскам
+    # сегментации (измерение вместо мнения). До мержа и поворота: работаем в
+    # исходной системе фото, состав не трогаем.
+    if segmentation_json:
+        try:
+            for note in measure_openings_from_masks(segmentation_json, plan):
+                debug.append("masks: %s" % note)
+        except Exception as exc:  # noqa: BLE001 - масочный слой не роняет план
+            debug.append("masks: ОШИБКА %s: %s (пропуск)" % (exc.__class__.__name__, exc))
+
+    if camera_probe_json or camera_probe2_json:
+        old = plan.get("camera", {}).get("position")
+        resolved, why = resolve_camera_position(
+            old, _probe_position(camera_probe_json), _probe_position(camera_probe2_json))
+        if resolved is not None and abs(resolved - (old or -1)) > 1e-9:
+            plan.setdefault("camera", {})["position"] = round(resolved, 3)
+            debug.append("camera_probe: позиция %s -> %.2f (%s)" % (old, resolved, why))
+        else:
+            debug.append("camera_probe: %s (позиция %s)" % (why, old))
+
+    # Почти-центральная камера прижимается к центру: фронтальные кадры снимают
+    # из середины комнаты, а дрожание оценок вокруг 0.5 (0.45/0.48/0.53) — шум
+    # (вердикт пользователя по bedroom; на эталоне правило УЛУЧШАЕТ среднюю
+    # ошибку 0.085 -> 0.074). Порог не трогает уверенно смещённые кадры (0.6+).
+    try:
+        cam_pos = float(plan.get("camera", {}).get("position", 0.5))
+    except (TypeError, ValueError):
+        cam_pos = 0.5
+    if abs(cam_pos - 0.5) <= CAMERA_CENTER_SNAP and abs(cam_pos - 0.5) > 1e-9:
+        plan.setdefault("camera", {})["position"] = 0.5
+        debug.append("camera_centered: %.2f -> 0.5 (фронтальный кадр)" % cam_pos)
 
     room = plan["room"]
     debug.append(
@@ -127,6 +249,32 @@ def build_empty_plan(extraction_json, scanner_openings_json="", room_type=""):
         debug.append("merge_drop: %s выброшен (на своей стене места нет)" % (key,))
     for key in merge_meta["dropped_unconfirmed"]:
         debug.append("merge_dropped_unconfirmed: %s выброшен (VLM назвал стену глухой)" % (key,))
+
+    # 2б) Коридор вдоль глухой (зеркальной) стены: стена с проёмами на самом
+    # деле боковая — размеры меняются местами, пассаж встаёт в её середину.
+    # Строго ДО развода конфликтов — угловой пассаж иначе гибнет там как
+    # «не влезающий».
+    corridor_notes = reorient_corridor_wall(plan)
+    if corridor_notes:
+        debug.append("corridor: %s" % ", ".join(corridor_notes))
+
+    # 2в) Дверь экстрактора на невидимой front-стене — под камеру (offset там
+    # всё равно догадка; снимают, как правило, от входа).
+    snap_notes = snap_front_door_to_camera(plan)
+    if snap_notes:
+        debug.append("front_door: %s" % ", ".join(snap_notes))
+
+    # 2г) Боковой проём не впритык к невидимому front-концу стены: простенок со
+    # стороны камеры не меньше MIN_FRONT_PIER_DW (гадание модели, кадр lroom).
+    pier_notes = keep_side_front_pier(plan)
+    if pier_notes:
+        debug.append("side_pier: %s" % ", ".join(pier_notes))
+
+    # 2д) Санитария ширин: проём уже физического минимума (дверь 0.7 м, окно
+    # 0.3 м) расширяется до него — модель занизила, щели не бывает (fin424).
+    width_notes = enforce_min_opening_widths(plan)
+    if width_notes:
+        debug.append("min_width: %s" % ", ".join(width_notes))
 
     # 3) Развод конфликтов: наложения и проёмы впритык к углу приходят и от VLM,
     # и из дефолтных позиций мержа. До гейта, чтобы он считал свободные интервалы

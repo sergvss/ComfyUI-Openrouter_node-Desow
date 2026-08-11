@@ -59,12 +59,16 @@ CAM_DOT_DW = 0.11           # полудиагональ ромба (legacy-ма
 # направление взгляда. Габарит 0.47 x 0.46 dw (~0.4 м) — вдвое крупнее прежнего
 # ромба: узнаваемость силуэта требует места, а на листе это по-прежнему мелкий знак.
 CAM_ICON_INSET_DW = 0.03    # зазор от внутренней грани стены до задней стенки корпуса
-CAM_ICON_BODY_DW = 0.30     # корпус вдоль взгляда
-CAM_ICON_WIDTH_DW = 0.46    # корпус поперёк взгляда
-CAM_ICON_BODY_R_DW = 0.07   # скругление корпуса
-CAM_ICON_LENS_DW = 0.14     # вылет объектива за корпус
-CAM_ICON_LENS_W_DW = 0.20   # ширина объектива
-CAM_ICON_LENS_R_DW = 0.04   # скругление объектива
+# Стиль знака (вердикт пользователя, бенч 16): корпус слегка вытянут вдоль
+# взгляда, углы ОСТРЫЕ (без скруглений), вокруг всего знака контрастная белая
+# обводка 2px финального листа - знак читается на любом фоне (сектор, стена,
+# дуга двери).
+CAM_ICON_BODY_DW = 0.38     # корпус вдоль взгляда (вытянут)
+CAM_ICON_WIDTH_DW = 0.42    # корпус поперёк взгляда
+CAM_ICON_LENS_DW = 0.16       # вылет объектива за корпус
+CAM_ICON_LENS_W_NEAR_DW = 0.14  # объектив-раструб: ширина у корпуса...
+CAM_ICON_LENS_W_FAR_DW = 0.30   # ...и на срезе (трапеция, расширяется по взгляду)
+CAM_ICON_BORDER_PX = 2      # обводка в пикселях ФИНАЛЬНОГО листа
 # Направление взгляда НА ЛИСТЕ (не в мире): y вниз, поэтому "up" — это -y.
 CAM_DIR_VEC = {"up": (0.0, -1.0), "down": (0.0, 1.0), "left": (-1.0, 0.0), "right": (1.0, 0.0)}
 # "camera_icon" — иконка + сектор (дефолт); "sector" и "dot" — прежний ромб
@@ -300,7 +304,8 @@ def _paint_camera(img, data: dict, poly: list, P, s: float, *, style: str = "cam
     # Точка стояния: доля длины стены -> точка на её ВНУТРЕННЕЙ грани (полигон
     # комнаты и есть внутренняя грань — стены рисуются наружу от него).
     start, end = wall_span(room, wall)
-    i, j, local = wall_edge(room, wall, poly, start + position * (end - start))
+    wall_coord = _dodge_door_arc(data, wall, start, end, start + position * (end - start))
+    i, j, local = wall_edge(room, wall, poly, wall_coord)
     (ax, ay), (ux, uy), ln = wall_params(poly, i, j)
     local = clamp(local, 0.0, ln)
     # Точка на внутренней грани стены, от неё маркер растёт внутрь комнаты.
@@ -321,10 +326,26 @@ def _paint_camera(img, data: dict, poly: list, P, s: float, *, style: str = "cam
         # Радиус заведомо больше комнаты: лишнее срежет маска пола, зато сектор
         # гарантированно дотягивается до дальней стены при любой форме.
         reach = math.hypot(max(xs) - min(xs), max(ys) - min(ys))
+        # Направление ВЗГЛЯДА (оптическая ось) — биссектриса лучей к углам
+        # back-стены, а не середина сектора покрытия: сектор несимметричен из-за
+        # боковых проёмов и скашивал иконку на фронтальных кадрах (вердикт
+        # пользователя, bedroom бенча 16А). Для камеры в центре взгляд выходит
+        # «прямо», для съёмки в угол (fin463) — честный наклон.
+        gaze = math.degrees(math.atan2(dy, dx))
+        if room.get("shape") == "rectangle" and wall == "front":
+            try:
+                width_dw = float(room["width_dw"])
+                left = math.atan2(0.0 - base[1], 0.0 - base[0])
+                right = math.atan2(0.0 - base[1], width_dw - base[0])
+                gaze = math.degrees((left + right) / 2)
+                dx, dy = math.cos(math.radians(gaze)), math.sin(math.radians(gaze))
+            except (KeyError, TypeError, ValueError):
+                pass
+        if not diamond:
+            cx, cy = base[0] + dx * apex_dw, base[1] + dy * apex_dw
+        a0, a1 = _sector_angles(data, room, wall, (cx, cy), gaze)
         px, py = P(cx, cy)
         r = reach * s * SS
-        view = math.degrees(math.atan2(dy, dx))
-        a0, a1 = view - CAM_FOV_DEG / 2, view + CAM_FOV_DEG / 2
         if a0 < 0:      # pieslice ждёт неотрицательные углы по часовой стрелке
             a0, a1 = a0 + 360, a1 + 360
         sector = Image.new("L", img.size, 0)
@@ -344,36 +365,136 @@ def _paint_camera(img, data: dict, poly: list, P, s: float, *, style: str = "cam
     return out
 
 
+# Зазор знака камеры от дверного проёма вдоль стены: полкорпуса знака + просвет,
+# чтобы дуга открывания не прочерчивала иконку насквозь.
+CAM_DOOR_DODGE_DW = 0.5
+
+
+def _dodge_door_arc(data: dict, wall: str, start: float, end: float, coord: float) -> float:
+    """Сдвиг ЗНАКА камеры вдоль стены из-под дверного полотна и дуги.
+
+    Данные не трогаются — позиция съёмки в plan_json остаётся честной (реальная
+    дверь и камера легитимно совпадают: снимали из проёма). Двигается только
+    рисунок знака в `_cam`-варианте: дуга прочерчивала иконку насквозь (аудит
+    архитектора 2026-08-10, frame13/frame14). Знак уходит за ближний косяк;
+    некуда (дверь во всю стену) — остаётся на месте.
+    """
+    for op in data.get("openings") or []:
+        if op.get("wall") != wall or op.get("type") not in ("door", "double_door"):
+            continue
+        try:
+            lo = float(op["offset_dw"]) - float(op["width_dw"]) / 2
+            hi = float(op["offset_dw"]) + float(op["width_dw"]) / 2
+        except (KeyError, TypeError, ValueError):
+            continue
+        if lo - CAM_DOOR_DODGE_DW < coord < hi + CAM_DOOR_DODGE_DW:
+            candidates = [c for c in (lo - CAM_DOOR_DODGE_DW, hi + CAM_DOOR_DODGE_DW)
+                          if start + 0.2 <= c <= end - 0.2]
+            if candidates:
+                return min(candidates, key=lambda c: abs(c - coord))
+    return coord
+
+
+def _sector_angles(data: dict, room: dict, cam_wall: str, apex, view: float):
+    """Углы сектора обзора (a0, a1) в градусах листа.
+
+    Раскрыв считается по составу плана, а не фиксированной константой (вердикт
+    пользователя, бенч 16): в кадр гарантированно попала ВСЯ back-стена (наша
+    конвенция) и каждый проём на боковых стенах, который экстрактор реально
+    видел, — сектор обязан накрывать их все. Лучи тянутся от точки съёмки к
+    углам back-стены и к дальним косякам боковых проёмов; вставки гейта
+    (`inserted`) не в счёт — их на фото не было. Ширина зажимается в
+    [CAM_FOV_DEG, 165°]: уже дефолтного конуса обзор не бывает (объектив
+    телефона), шире 165° — вырожденный веер на всю комнату.
+
+    Не rectangle или камера не на front — прежний фиксированный конус.
+    """
+    half = CAM_FOV_DEG / 2
+    if room.get("shape") != "rectangle" or cam_wall != "front":
+        return view - half, view + half
+    try:
+        width = float(room["width_dw"])
+        depth = float(room["depth_dw"])
+    except (KeyError, TypeError, ValueError):
+        return view - half, view + half
+    cx, cy = apex
+    targets = [(0.0, 0.0), (width, 0.0)]                 # углы back-стены
+    for op in data.get("openings") or []:
+        if op.get("inserted") or op.get("wall") not in ("left", "right"):
+            continue
+        try:
+            lo = float(op["offset_dw"]) - float(op["width_dw"]) / 2
+            hi = float(op["offset_dw"]) + float(op["width_dw"]) / 2
+        except (KeyError, TypeError, ValueError):
+            continue
+        x = 0.0 if op["wall"] == "left" else width
+        targets += [(x, clamp(lo, 0.0, depth)), (x, clamp(hi, 0.0, depth))]
+    deltas = []
+    for tx, ty in targets:
+        if math.hypot(tx - cx, ty - cy) < 1e-6:
+            continue
+        ang = math.degrees(math.atan2(ty - cy, tx - cx))
+        deltas.append((ang - view + 180.0) % 360.0 - 180.0)
+    if not deltas:
+        return view - half, view + half
+    # Раскрыв СИММЕТРИЧЕН вокруг оси взгляда (вердикт пользователя: как у
+    # настоящего объектива — полууглы влево и вправо равны). Ширина берётся по
+    # самому далёкому от оси видимому таргету, чтобы всё попало в клин.
+    margin = 3.0                                          # чтобы косяк не лежал на краю заливки
+    sym_half = max(half, min(max(abs(d) for d in deltas) + margin, 82.5))
+    return view - sym_half, view + sym_half
+
+
 def _draw_camera_icon(out, P, s: float, base, direction) -> None:
     """Иконка камеры в точке съёмки: корпус со скруглением + объектив по взгляду.
 
-    Направления камеры только осевые (`CAM_DIR_VEC`), поэтому обе части иконки —
-    обычные прямоугольники в осях листа: скругление рисует Pillow, а сглаживает
-    финальный даунскейл суперсэмпла. Объектив кладётся первым, корпус поверх —
-    так стык двух прямоугольников не виден.
-
-    `base` — точка на ВНУТРЕННЕЙ грани стены; иконка растёт от неё внутрь комнаты.
+    Направление произвольное (объектив смотрит в середину сектора обзора —
+    вердикт пользователя, бенч 16): иконка рисуется осевой на отдельном
+    прозрачном слое (объектив кладётся первым, корпус поверх — стык не виден),
+    поворачивается на угол взгляда и сажается задней стенкой на `base` — точку
+    на ВНУТРЕННЕЙ грани стены, от которой растёт внутрь комнаты.
     """
     fx, fy = direction
-    rx, ry = -fy, fx                      # поперечная ось
-    draw = ImageDraw.Draw(out)
-    ink = (INK, INK, INK)
-
-    def box(f0: float, f1: float, half_w: float):
-        a = P(base[0] + fx * f0 - rx * half_w, base[1] + fy * f0 - ry * half_w)
-        b = P(base[0] + fx * f1 + rx * half_w, base[1] + fy * f1 + ry * half_w)
-        return [min(a[0], b[0]), min(a[1], b[1]), max(a[0], b[0]), max(a[1], b[1])]
-
     px = s * SS                           # dw -> суперсэмпл-пиксели
+    border = CAM_ICON_BORDER_PX * SS     # 2px финального листа до даунскейла
+    length = CAM_ICON_INSET_DW + CAM_ICON_BODY_DW + CAM_ICON_LENS_DW
+    pad = int(math.ceil(length * px + border)) + 4   # запас на любой поворот
+    side = pad * 2
+    icon = Image.new("RGBA", (side, side), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(icon)
+    ink = (INK, INK, INK, 255)
+    white = (PAGE, PAGE, PAGE, 255)
+    ax, ay = float(pad), float(pad)                # якорь = задняя стенка корпуса
+
+    def fbox(f0: float, f1: float, half_w: float, grow: float = 0.0):
+        return [ax + f0 * px - grow, ay - half_w * px - grow,
+                ax + f1 * px + grow, ay + half_w * px + grow]
+
+    def lens_poly(grow: float = 0.0):
+        # Объектив-раструб (вердикт пользователя): трапеция от корпуса наружу,
+        # узкая у тела, широкая на срезе - читается как «смотрит туда».
+        f0 = body_end * px - grow
+        f1 = (body_end + CAM_ICON_LENS_DW) * px + grow
+        near = CAM_ICON_LENS_W_NEAR_DW / 2 * px + grow
+        far = CAM_ICON_LENS_W_FAR_DW / 2 * px + grow
+        return [(ax + f0, ay - near), (ax + f1, ay - far),
+                (ax + f1, ay + far), (ax + f0, ay + near)]
+
     body_end = CAM_ICON_INSET_DW + CAM_ICON_BODY_DW
-    draw.rounded_rectangle(
-        box(body_end - CAM_ICON_LENS_R_DW, body_end + CAM_ICON_LENS_DW, CAM_ICON_LENS_W_DW / 2),
-        radius=CAM_ICON_LENS_R_DW * px, fill=ink,
-    )
-    draw.rounded_rectangle(
-        box(CAM_ICON_INSET_DW, body_end, CAM_ICON_WIDTH_DW / 2),
-        radius=CAM_ICON_BODY_R_DW * px, fill=ink,
-    )
+    body = (CAM_ICON_INSET_DW, body_end, CAM_ICON_WIDTH_DW / 2)
+    # Сначала белый силуэт, раздутый на ширину обводки, затем чёрное тело -
+    # получается контрастная окантовка вокруг всего знака. Углы острые.
+    draw.polygon(lens_poly(grow=border), fill=white)
+    draw.rectangle(fbox(*body, grow=border), fill=white)
+    draw.polygon(lens_poly(), fill=ink)
+    draw.rectangle(fbox(*body), fill=ink)
+    # PIL поворачивает против часовой в визуальных осях; у листа y растёт вниз,
+    # поэтому вектор (fx, fy) достигается углом atan2(-fy, fx). Поворот вокруг
+    # якоря — канвас с запасом не даёт срезать углы.
+    icon = icon.rotate(math.degrees(math.atan2(-fy, fx)), resample=Image.BICUBIC,
+                       center=(ax, ay))
+    bx, by = P(base[0], base[1])
+    out.paste(icon, (int(round(bx - ax)), int(round(by - ay))), icon)
 
 
 def _draw_furniture(dr, P, s, f: dict) -> None:

@@ -10,8 +10,12 @@ import pytest
 from PIL import Image, ImageChops
 
 from desow_plan import blank_png, build_empty_plan, render_camera_png
-from desow_plan.gate import ensure_door_and_window, resolve_opening_conflicts
-from desow_plan.merge import merge_with_scanner, scanner_openings_from_scan
+from desow_plan.gate import (
+    ensure_door_and_window,
+    resolve_opening_conflicts,
+    snap_front_door_to_camera,
+)
+from desow_plan.merge import merge_with_scanner, reorient_corridor_wall, scanner_openings_from_scan
 from desow_plan.render import CANVAS, render_plan
 from desow_plan.scanner import parse_scanner_openings
 from desow_plan.validate import validate_structure
@@ -576,6 +580,167 @@ def test_merge_fallback_keeps_the_balcony_subtype_on_the_same_wall():
     assert [o["type"] for o in merged["openings"]] == ["balcony_door", "window"]
 
 
+# ── медиана прогонов экстрактора ─────────────────────────────────────
+
+def test_median_extractions_kills_the_outlier_run():
+    from desow_plan.merge import median_extractions
+    # lroom: дверь left в трёх прогонах 3.3 / 1.2 / 3.6 — выброс 1.2 гасится.
+    def run(door_offset, width):
+        return {"room": {"shape": "rectangle", "width_dw": width, "depth_dw": 5.2},
+                "openings": [{"type": "door", "wall": "left", "offset_dw": door_offset,
+                              "width_dw": 1.0}]}
+    base, r2, r3 = run(3.3, 4.6), run(1.2, 4.4), run(3.6, 4.8)
+    median_extractions([base, r2, r3])
+    door = base["openings"][0]
+    assert door["offset_dw"] == pytest.approx(3.3)       # медиана 1.2/3.3/3.6
+    assert base["room"]["width_dw"] == pytest.approx(4.6)  # медиана 4.4/4.6/4.8
+    # Выброс в БАЗОВОМ прогоне тоже переголосуется двумя нормальными.
+    base2, r22, r32 = run(1.2, 4.6), run(3.3, 4.6), run(3.6, 4.6)
+    median_extractions([base2, r22, r32])
+    assert base2["openings"][0]["offset_dw"] == pytest.approx(3.3)
+    # А совсем чужое прочтение (дальше SAME_OPENING_TOL_DW) в медиану не идёт.
+    base3 = run(3.3, 4.6)
+    median_extractions([base3, run(0.5, 4.6)])
+    assert base3["openings"][0]["offset_dw"] == pytest.approx(3.3)
+
+
+def test_median_extractions_single_run_is_untouched():
+    from desow_plan.merge import median_extractions
+    plan = {"room": {"shape": "rectangle", "width_dw": 4.0, "depth_dw": 5.0},
+            "openings": [{"type": "window", "wall": "back", "offset_dw": 2.0, "width_dw": 1.6}]}
+    assert median_extractions([plan]) == []
+    assert plan["openings"][0]["offset_dw"] == pytest.approx(2.0)
+
+
+# ── коридорная стена — боковая (поворот) ─────────────────────────────
+
+def fin463_like_plan(**overrides):
+    """Кадр fin463: зеркало сделало right глухой, пассаж коридора в углу back."""
+    base = {
+        "room": {"shape": "rectangle", "width_dw": 6.2, "depth_dw": 4.5},
+        "openings": [
+            {"type": "door", "wall": "back", "offset_dw": 4.3, "width_dw": 1.0,
+             "swing": {"hinge": "left", "direction": "in"}, "confidence": 0.95},
+            {"type": "passage", "wall": "back", "offset_dw": 5.6, "width_dw": 0.95,
+             "confidence": 0.9},
+        ],
+        "camera": {**DEFAULT_CAMERA, "position": 0.65},
+        "solid_walls": ["left", "right"],
+    }
+    base.update(overrides)
+    return base
+
+
+def test_corridor_wall_becomes_the_side_wall():
+    plan = fin463_like_plan()
+    notes = reorient_corridor_wall(plan)
+    # Размеры меняются местами: комната уже и вытянутая (вердикт пользователя).
+    assert plan["room"]["width_dw"] == pytest.approx(4.5)
+    assert plan["room"]["depth_dw"] == pytest.approx(6.2)
+    # Пассаж — в середину боковой стены: точную глубину устья с фото не измерить.
+    passage = next(o for o in plan["openings"] if o["type"] == "passage")
+    assert passage["wall"] == "right"
+    assert passage["offset_dw"] == pytest.approx(3.1)
+    # Дверь стояла впритык к устью (косяк 4.8 при устье 5.125) — она видна
+    # сквозь проём и принадлежит коридору, не комнате.
+    assert not any(o["type"] == "door" for o in plan["openings"])
+    assert "corridor_door_dropped:door/back" in notes
+    # Камера сохраняет смещение к коридорной стороне.
+    assert plan["camera"]["position"] == pytest.approx(0.65)
+    # Большая пустая плоскость становится back и остаётся глухой; зеркальная
+    # метка расформирована — её плоскость больше не образует целой стены.
+    assert plan["solid_walls"] == ["back"]
+    assert notes[0].startswith("corridor_wall_to_side:right")
+    assert "mirror_wall_dissolved:right" in notes
+
+
+def test_corridor_wall_keeps_a_door_far_from_the_mouth():
+    # Дверь в глубине стены (косяк дальше 0.5 dw от устья) — своя, переезжает
+    # на боковую стену с тем же отсчётом от общего угла.
+    plan = fin463_like_plan()
+    plan["openings"][0]["offset_dw"] = 2.0
+    reorient_corridor_wall(plan)
+    door = next(o for o in plan["openings"] if o["type"] == "door")
+    assert door["wall"] == "right"
+    assert door["offset_dw"] == pytest.approx(2.0)
+
+
+def test_corridor_wall_mirrored_on_the_left_side():
+    plan = fin463_like_plan(
+        openings=[
+            {"type": "door", "wall": "back", "offset_dw": 3.6, "width_dw": 1.0,
+             "swing": {"hinge": "right", "direction": "in"}, "confidence": 0.95},
+            {"type": "passage", "wall": "back", "offset_dw": 0.6, "width_dw": 0.95,
+             "confidence": 0.9},
+        ],
+        camera={**DEFAULT_CAMERA, "position": 0.35},
+        solid_walls=["left"],
+    )
+    notes = reorient_corridor_wall(plan)
+    assert plan["room"]["width_dw"] == pytest.approx(4.5)
+    assert plan["room"]["depth_dw"] == pytest.approx(6.2)
+    passage = next(o for o in plan["openings"] if o["type"] == "passage")
+    assert passage["wall"] == "left"
+    assert passage["offset_dw"] == pytest.approx(3.1)
+    # Отсчёт от общего угла — правого угла старой back-стены: 6.2 - 3.6 = 2.6
+    # (дальше CORRIDOR_DOOR_TOL_DW от устья — дверь своя, не коридорная).
+    door = next(o for o in plan["openings"] if o["type"] == "door")
+    assert door["wall"] == "left"
+    assert door["offset_dw"] == pytest.approx(2.6)
+    assert plan["solid_walls"] == []      # back глухой не объявляли
+    assert "passage_mid_side:left 3.10" in notes
+
+
+def test_corridor_mouth_read_as_a_door_still_reorients():
+    # Прогоны бенча 16 читали устье коридора то passage, то door: тип не признак,
+    # признак — вход, прижатый к углу глухой стены. Дверь-устье нормализуется в
+    # passage (полотна у входа в коридор нет), коридорная дверь рядом выброшена.
+    plan = fin463_like_plan(openings=[
+        {"type": "door", "wall": "back", "offset_dw": 4.3, "width_dw": 1.0,
+         "swing": {"hinge": "left", "direction": "in"}, "confidence": 0.95},
+        {"type": "door", "wall": "back", "offset_dw": 5.6, "width_dw": 0.95,
+         "swing": {"hinge": "right", "direction": "in"}, "confidence": 0.9},
+    ])
+    notes = reorient_corridor_wall(plan)
+    assert "corridor_mouth:door->passage" in notes
+    passage = next(o for o in plan["openings"] if o["type"] == "passage")
+    assert passage["wall"] == "right" and "swing" not in passage
+    assert not any(o["type"] == "door" for o in plan["openings"])
+    assert "corridor_door_dropped:door/back" in notes
+
+
+def test_corridor_wall_needs_a_solid_side_wall():
+    # Без вердикта «стена глухая» пассаж в углу — обычный проём, не поворачиваем.
+    plan = fin463_like_plan(solid_walls=[])
+    assert reorient_corridor_wall(plan) == []
+    assert plan["room"]["width_dw"] == pytest.approx(6.2)
+
+
+def test_corridor_wall_needs_the_passage_at_the_corner():
+    # Пассаж в середине стены — это проход в соседнее помещение, а не коридор.
+    plan = fin463_like_plan()
+    plan["openings"][1]["offset_dw"] = 3.0
+    assert reorient_corridor_wall(plan) == []
+
+
+def test_corridor_wall_skips_ambiguous_compositions():
+    # Проём на большой пустой плоскости (будущей back) — переотсчёт не однозначен,
+    # честнее не трогать. То же для front и перегородок.
+    plan = fin463_like_plan()
+    plan["openings"].append({"type": "window", "wall": "left", "offset_dw": 2.0, "width_dw": 1.0})
+    assert reorient_corridor_wall(plan) == []
+    plan = fin463_like_plan(partitions=[{"attach": "back", "offset_dw": 2.0, "length_dw": 1.0}])
+    assert reorient_corridor_wall(plan) == []
+
+
+def test_corridor_wall_ignores_a_wall_wide_passage():
+    # Проём в полстены — не устье коридора.
+    plan = fin463_like_plan(openings=[
+        {"type": "passage", "wall": "back", "offset_dw": 3.6, "width_dw": 5.0, "confidence": 0.9},
+    ])
+    assert reorient_corridor_wall(plan) == []
+
+
 # ── gate ─────────────────────────────────────────────────────────────
 
 def test_gate_inserts_door_at_front_corner():
@@ -592,8 +757,9 @@ def test_gate_inserts_door_at_front_corner():
 def test_gate_narrows_the_entrance_instead_of_leaving_the_front_wall():
     """Кадр frame14: коридор 1.15 м шириной — вход остаётся на front, но уже.
 
-    Дверь 1.0 dw с простенками 0.2 м требует 1.4 dw; раньше гейт при нехватке
-    уводил вход на длинную боковую стену, хотя снимали именно из проёма во front.
+    Дверь 1.0 dw с простенками 0.2 м требует 1.4 dw; гейт сужает саму дверь, а
+    простенок 0.2 м держит ЖЁСТКО (вердикт пользователя по аудиту архитектора
+    2026-08-10: норма важнее, знак камеры отступает первым).
     """
     plan = {"room": {"shape": "rectangle", "width_dw": 1.35, "depth_dw": 4.8},
             "openings": [{"type": "window", "wall": "back", "offset_dw": 0.675, "width_dw": 0.88}]}
@@ -603,9 +769,9 @@ def test_gate_narrows_the_entrance_instead_of_leaving_the_front_wall():
     assert door["wall"] == "front"                       # стена не сменилась
     assert "door_inserted" in notes
     assert door["width_dw"] >= 0.82                      # не уже 0.7 м
-    # Простенок «в обрез» 0.1 м вместо нормы 0.2 — цена того, что вход остался там,
-    # где он есть на самом деле.
-    assert door["offset_dw"] - door["width_dw"] / 2 >= 0.1 / 0.85 - 1e-3
+    # Норма 0.2 м от обоих углов — без всяких «в обрез».
+    assert door["offset_dw"] - door["width_dw"] / 2 >= MIN_CORNER_CLEARANCE_DW - 1e-3
+    assert door["offset_dw"] + door["width_dw"] / 2 <= 1.35 - MIN_CORNER_CLEARANCE_DW + 1e-3
 
 
 def test_gate_leaves_the_front_wall_only_when_even_a_narrow_door_does_not_fit():
@@ -617,23 +783,260 @@ def test_gate_leaves_the_front_wall_only_when_even_a_narrow_door_does_not_fit():
     assert any(n.startswith("door_inserted:") for n in notes)
 
 
-def test_gate_inserts_window_at_front_center():
+def test_gate_inserts_window_on_front_by_default():
+    # Обе боковые без проходов: их видели в кадре (глухими) — окно на них
+    # противоречит фото (вердикт пользователя по fin380 «откуда появилось
+    # окно?»); наименее ложное место — невидимая front-стена.
     plan = plan_with(openings=[{"type": "door", "wall": "left", "offset_dw": 1.0, "width_dw": 1.0}])
     notes = ensure_door_and_window(plan)
     assert notes == ["window_inserted"]
     window = plan["openings"][-1]
     assert window["type"] == "window" and window["wall"] == "front"
-    assert window["offset_dw"] == pytest.approx(2.0)     # центр стены 4.0 dw
     assert window["width_dw"] == 1.6
+    assert_no_overlaps(plan, clearance=MIN_CORNER_CLEARANCE_DW)
+
+
+def test_gate_window_goes_opposite_a_side_passage():
+    # Проход на правой стене (коридорный кейс fin463): напротив него — зона,
+    # которую кадр толком не видел, окно-вставка честнее всего там.
+    plan = plan_with(openings=[
+        {"type": "passage", "wall": "right", "offset_dw": 2.5, "width_dw": 1.0},
+    ])
+    notes = ensure_door_and_window(plan)
+    assert "window_inserted:left" in notes
+    window = next(o for o in plan["openings"] if o["type"] == "window")
+    assert window["wall"] == "left"
+    assert window["offset_dw"] == pytest.approx(2.5)     # центр стены 5.0 dw
+
+
+def test_gate_window_unseals_the_solid_wall():
+    # Окно встало на стену из solid_walls: метка глухости снимается, иначе
+    # schema_lite при следующем парсе выбросит этот же проём как противоречие.
+    plan = plan_with(
+        openings=[{"type": "passage", "wall": "right", "offset_dw": 2.5, "width_dw": 1.0}],
+        solid_walls=["left"],
+    )
+    notes = ensure_door_and_window(plan)
+    assert "window_inserted:left" in notes and "solid_wall_opened:left" in notes
+    assert plan["solid_walls"] == []
+
+
+def test_narrow_openings_are_widened_to_the_physical_minimum():
+    from desow_plan.gate import enforce_min_opening_widths
+    # fin424: балконная дверь 0.64 м от экстрактора — дверей уже 0.7 м не бывает.
+    plan = plan_with(openings=[
+        {"type": "balcony_door", "wall": "back", "offset_dw": 2.0, "width_dw": 0.75,
+         "swing": {"hinge": "left", "direction": "in"}},
+        {"type": "window", "wall": "left", "offset_dw": 2.0, "width_dw": 1.0},
+    ])
+    notes = enforce_min_opening_widths(plan)
+    assert notes == ["widened:balcony_door/back 0.75->0.82"]
+    assert plan["openings"][0]["width_dw"] == pytest.approx(0.7 / 0.85, abs=1e-2)
+    assert plan["openings"][1]["width_dw"] == pytest.approx(1.0)   # норма не тронута
+
+
+def test_camera_icon_dodges_the_door_arc():
+    from desow_plan.render import CAM_DOOR_DODGE_DW, _dodge_door_arc
+    data = {"openings": [
+        {"type": "door", "wall": "front", "offset_dw": 3.0, "width_dw": 1.0},
+    ]}
+    # Знак в проёме двери — уходит за ближний ДОСТУПНЫЙ косяк: на стене 4.0
+    # правый кандидат (4.0) вылезает за край, знак уходит влево от двери.
+    assert _dodge_door_arc(data, "front", 0.0, 4.0, 3.1) == pytest.approx(2.5 - CAM_DOOR_DODGE_DW)
+    # На длинной стене — к ближнему косяку (справа).
+    assert _dodge_door_arc(data, "front", 0.0, 6.0, 3.4) == pytest.approx(3.5 + CAM_DOOR_DODGE_DW)
+    # Вне дуги — не трогается; чужая стена — не трогается.
+    assert _dodge_door_arc(data, "front", 0.0, 4.0, 1.0) == pytest.approx(1.0)
+    assert _dodge_door_arc(data, "back", 0.0, 4.0, 3.1) == pytest.approx(3.1)
+
+
+def test_side_opening_keeps_a_pier_before_the_unseen_wall_end():
+    from desow_plan.gate import MIN_FRONT_PIER_DW, keep_side_front_pier
+    # lroom: проход на правой стене нарисован впритык к невидимому концу стены
+    # у камеры — сдвигается к back до минимального простенка 0.8 dw.
+    plan = plan_with(openings=[
+        {"type": "passage", "wall": "right", "offset_dw": 4.4, "width_dw": 1.6},
+        {"type": "door", "wall": "left", "offset_dw": 2.0, "width_dw": 1.0},
+    ])
+    notes = keep_side_front_pier(plan)
+    passage = plan["openings"][0]
+    # depth 5.0: предел = 5.0 - 0.8 - 0.8 = 3.4
+    assert passage["offset_dw"] == pytest.approx(5.0 - MIN_FRONT_PIER_DW - 0.8)
+    assert notes and notes[0].startswith("side_pier:passage/right")
+    # Дверь с нормальным простенком не тронута.
+    assert plan["openings"][1]["offset_dw"] == pytest.approx(2.0)
+
+
+def test_front_door_from_the_extractor_snaps_to_the_camera():
+    # frame13: дверь на front-стене (не видна в кадре) — offset модели дрожит;
+    # снимали из двери, дверь встаёт под камеру. Вставку гейта правило не трогает.
+    plan = plan_with(
+        openings=[{"type": "door", "wall": "front", "offset_dw": 1.2, "width_dw": 1.0,
+                   "swing": {"hinge": "left", "direction": "in"}}],
+        camera={**DEFAULT_CAMERA, "position": 0.75},
+    )
+    notes = snap_front_door_to_camera(plan)
+    assert notes and notes[0].startswith("front_door_to_camera:1.20->3.00")
+    assert plan["openings"][0]["offset_dw"] == pytest.approx(0.75 * 4.0)
+    inserted = plan_with(
+        openings=[{"type": "door", "wall": "front", "offset_dw": 0.735, "width_dw": 1.0,
+                   "swing": {"hinge": "left", "direction": "in"}, "inserted": True}],
+        camera={**DEFAULT_CAMERA, "position": 0.75},
+    )
+    assert snap_front_door_to_camera(inserted) == []
+    assert inserted["openings"][0]["offset_dw"] == pytest.approx(0.735)
+
+
+def test_gate_window_prefers_a_blank_side_wall_over_a_busy_one():
+    # Кейс бенча 16 (fin463): камера дрогнула к 0.35, «дальней» стала правая
+    # стена с пассажем коридора — окно всё равно обязано уйти на свободную
+    # левую, а не в стену, за которой коридор.
+    plan = plan_with(
+        openings=[{"type": "passage", "wall": "right", "offset_dw": 2.5, "width_dw": 1.0}],
+        camera={**DEFAULT_CAMERA, "position": 0.35},
+    )
+    notes = ensure_door_and_window(plan)
+    assert "window_inserted:left" in notes
+    window = next(o for o in plan["openings"] if o["type"] == "window")
+    assert window["wall"] == "left"
+
+
+def test_gate_door_corner_prefers_the_solid_side():
+    # frame13: зеркальный шкаф сделал right глухой — реальный вход рядом с ним,
+    # дверь гейта прижимается к правому углу front-стены.
+    plan = plan_with(
+        openings=[{"type": "window", "wall": "back", "offset_dw": 2.0, "width_dw": 1.5}],
+        solid_walls=["right"],
+    )
+    ensure_door_and_window(plan)
+    door = next(o for o in plan["openings"] if o["type"] == "door")
+    assert door["wall"] == "front"
+    assert door["offset_dw"] > ROOM["width_dw"] / 2       # правая половина
+    assert door["inserted"] is True
+
+
+def test_gate_door_corner_avoids_the_side_with_glazing():
+    # frame12: балконная дверь на right — вход не делают вплотную к остеклению,
+    # дверь гейта уходит к левому углу.
+    plan = plan_with(openings=[
+        {"type": "window", "wall": "back", "offset_dw": 2.0, "width_dw": 1.5},
+        {"type": "balcony_door", "wall": "right", "offset_dw": 2.5, "width_dw": 0.9},
+    ])
+    ensure_door_and_window(plan)
+    door = next(o for o in plan["openings"] if o["type"] == "door")
+    assert door["wall"] == "front"
+    assert door["offset_dw"] < ROOM["width_dw"] / 2       # левая половина
+
+
+def test_gate_door_corner_tie_breaks_away_from_the_camera():
+    # Обе боковые пустые и не глухие: угол — дальний от камеры (его не видно
+    # в кадре, дверь там правдоподобнее всего).
+    plan = plan_with(
+        openings=[{"type": "window", "wall": "back", "offset_dw": 2.0, "width_dw": 1.5}],
+        camera={**DEFAULT_CAMERA, "position": 0.8},
+    )
+    ensure_door_and_window(plan)
+    door = next(o for o in plan["openings"] if o["type"] == "door")
+    assert door["offset_dw"] < ROOM["width_dw"] / 2       # камера справа -> дверь слева
+
+
+def test_camera_consensus_cascade():
+    from desow_plan.pipeline import resolve_camera_position
+    # Согласие с экстрактором - первичная проба (обычный случай).
+    assert resolve_camera_position(0.5, 0.6, None)[0] == pytest.approx(0.6)
+    # frame12: проба спорит с экстрактором, арбитр разошёлся с пробой и ближе
+    # к экстрактору - берём арбитра.
+    assert resolve_camera_position(0.35, 0.75, 0.35)[0] == pytest.approx(0.35)
+    # fin463: проба спорит с экстрактором, но арбитр согласен с пробой -
+    # экстрактор неправ (тянет к центру).
+    assert resolve_camera_position(0.35, 0.85, 0.75)[0] == pytest.approx(0.85)
+    # Проб нет - остаётся экстрактор.
+    assert resolve_camera_position(0.4, None, None)[0] is None
+
+
+def test_camera_probe_overrides_the_extractor_position():
+    extraction = json.dumps({
+        "room": {"shape": "rectangle", "width_dw": 4.0, "depth_dw": 5.0},
+        "openings": [], "camera": {"position": 0.5},
+    })
+    probe = '```json\n{"reason": "правая стена крупно", "position": 0.82}\n```'
+    _png, plan_json, debug = build_empty_plan(extraction, camera_probe_json=probe)
+    plan = json.loads(plan_json)
+    assert plan["camera"]["position"] == pytest.approx(0.82)
+    assert any(line.startswith("camera_probe: позиция") for line in debug.splitlines())
+
+
+def test_camera_probe_garbage_keeps_the_extractor_position():
+    # 0.35 - вне порога центрирования (CAMERA_CENTER_SNAP), позиция не трогается.
+    extraction = json.dumps({
+        "room": {"shape": "rectangle", "width_dw": 4.0, "depth_dw": 5.0},
+        "openings": [], "camera": {"position": 0.35},
+    })
+    for garbage in ("не json", '{"position": 7.5}', '{"reason": "без числа"}'):
+        _png, plan_json, _debug = build_empty_plan(extraction, camera_probe_json=garbage)
+        assert json.loads(plan_json)["camera"]["position"] == pytest.approx(0.35)
+
+
+def test_sector_angles_are_symmetric_and_cover_side_openings():
+    from desow_plan.render import CAM_FOV_DEG, _sector_angles
+    room = {"shape": "rectangle", "width_dw": 4.0, "depth_dw": 5.0}
+    base = {"room": room, "openings": []}
+    apex = (2.0, 4.6)
+    # Пустая комната: раскрыв симметричен вокруг оси (как настоящий объектив).
+    a0, a1 = _sector_angles(base, room, "front", apex, -90.0)
+    assert (a0 + a1) / 2 == pytest.approx(-90.0)
+    assert a1 - a0 >= CAM_FOV_DEG - 1e-9
+    # Реальный проём у камеры на правой стене раскрывает клин шире, но
+    # СИММЕТРИЧНО: полууглы влево и вправо равны (вердикт пользователя).
+    with_passage = {"room": room, "openings": [
+        {"type": "passage", "wall": "right", "offset_dw": 3.5, "width_dw": 1.0}]}
+    b0, b1 = _sector_angles(with_passage, room, "front", apex, -90.0)
+    assert (b0 + b1) / 2 == pytest.approx(-90.0)
+    assert b1 - b0 > a1 - a0 + 10
+    # Вставка гейта клин не раскрывает: её на фото не видели.
+    with_inserted = {"room": room, "openings": [
+        {"type": "window", "wall": "right", "offset_dw": 3.5, "width_dw": 1.0,
+         "inserted": True}]}
+    c0, c1 = _sector_angles(with_inserted, room, "front", apex, -90.0)
+    assert (c0, c1) == pytest.approx((a0, a1))
+
+
+def test_camera_position_snaps_to_center():
+    extraction = json.dumps({
+        "room": {"shape": "rectangle", "width_dw": 4.0, "depth_dw": 5.0},
+        "openings": [], "camera": {"position": 0.45},
+    })
+    _png, plan_json, debug = build_empty_plan(extraction)
+    assert json.loads(plan_json)["camera"]["position"] == pytest.approx(0.5)
+    assert any(line.startswith("camera_centered") for line in debug.splitlines())
+    # Уверенно смещённая камера не прижимается.
+    extraction2 = json.dumps({
+        "room": {"shape": "rectangle", "width_dw": 4.0, "depth_dw": 5.0},
+        "openings": [], "camera": {"position": 0.65},
+    })
+    _png, plan_json2, _d = build_empty_plan(extraction2)
+    assert json.loads(plan_json2)["camera"]["position"] == pytest.approx(0.65)
+
+
+def test_gate_window_falls_back_to_front_when_sides_are_full():
+    plan = plan_with(openings=[
+        {"type": "door", "wall": "back", "offset_dw": 2.0, "width_dw": 1.0},
+        {"type": "passage", "wall": "left", "offset_dw": 2.5, "width_dw": 4.4},
+        {"type": "passage", "wall": "right", "offset_dw": 2.5, "width_dw": 4.4},
+    ])
+    notes = ensure_door_and_window(plan)
+    assert notes == ["window_inserted"]
+    window = plan["openings"][-1]
+    assert window["wall"] == "front"
+    assert window["offset_dw"] == pytest.approx(2.0)     # центр стены 4.0 dw
 
 
 def test_gate_inserts_both_without_overlap():
     plan = plan_with(openings=[])
     assert ensure_door_and_window(plan) == ["door_inserted", "window_inserted"]
     door, window = plan["openings"]
-    door_right = door["offset_dw"] + door["width_dw"] / 2
-    window_left = window["offset_dw"] - window["width_dw"] / 2
-    assert window_left >= door_right - 1e-6
+    assert door["wall"] == "front" and window["wall"] == "front"
+    assert_no_overlaps(plan, clearance=MIN_CORNER_CLEARANCE_DW)
 
 
 def test_gate_is_noop_when_door_and_window_present():
@@ -1241,7 +1644,8 @@ def test_node_returns_image_tensor():
         pytest.skip("в sys.modules заглушка torch, а не настоящий пакет")
     from desow_plan_node import DesowPlanRender
 
-    image, plan_json, debug, plan_camera = DesowPlanRender().render(EXTRACTION, "", "bedroom")
+    image, plan_json, debug, plan_camera, _camera_json = DesowPlanRender().render(
+        EXTRACTION, "", "bedroom")
     assert image.shape == (1, 928, 1152, 3)                # [batch, H, W, RGB]
     assert str(image.dtype) == "torch.float32"
     assert 0.0 <= float(image.min()) and float(image.max()) <= 1.0
@@ -1257,5 +1661,25 @@ def test_node_output_contract_is_append_only():
     pytest.importorskip("numpy")
     from desow_plan_node import DesowPlanRender
 
-    assert DesowPlanRender.RETURN_NAMES == ("image", "plan_json", "debug", "plan_camera")
-    assert DesowPlanRender.RETURN_TYPES == ("IMAGE", "STRING", "STRING", "IMAGE")
+    assert DesowPlanRender.RETURN_NAMES == (
+        "image", "plan_json", "debug", "plan_camera", "camera_json")
+    assert DesowPlanRender.RETURN_TYPES == ("IMAGE", "STRING", "STRING", "IMAGE", "STRING")
+
+
+def test_node_camera_json_output():
+    """camera_json - блок camera из плана отдельной строкой; пустой план -> ''."""
+    torch = pytest.importorskip("torch", reason="обёртка импортирует torch")
+    pytest.importorskip("numpy")
+    if not hasattr(torch, "from_numpy"):
+        pytest.skip("в sys.modules заглушка torch, а не настоящий пакет")
+    from desow_plan_node import DesowPlanRender
+
+    raw = json.dumps(plan_with(openings=[
+        {"type": "door", "wall": "left", "offset_dw": 2.0, "width_dw": 1.0},
+        {"type": "window", "wall": "back", "offset_dw": 2.0, "width_dw": 1.5},
+    ]))
+    out = DesowPlanRender().render(raw)
+    plan = json.loads(out[1])
+    assert json.loads(out[4]) == plan["camera"]
+    broken = DesowPlanRender().render("не json ни разу")
+    assert broken[1] == "" and broken[4] == ""

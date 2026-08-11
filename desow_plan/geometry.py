@@ -257,6 +257,7 @@ def place_opening(
     *,
     anchor: str = "center",
     min_width: float = MIN_OPENING_WIDTH_DW,
+    prefer_side: str | None = None,
 ):
     """Куда поставить проём шириной `width` среди свободных отрезков `spans`.
 
@@ -266,8 +267,11 @@ def place_opening(
 
     `anchor="center"` — ближе к центру стены (окна, проходы); `"corner"` — прижать
     к ближайшему углу (двери; простенок 0.2 м уже заложен в `usable_spans`).
-    Целиком не влезает — проём сужается по самому широкому отрезку, но не меньше
-    `min_width`.
+    `prefer_side` ("left"/"right") — к какому концу стены тяготеть при
+    anchor="corner": выбор угла перестаёт зависеть от того, какой свободный
+    отрезок случайно оказался ближе (двери гейта скакали по углам от дрожания
+    экстракции, бенч 15↔16). Целиком не влезает — проём сужается по самому
+    широкому отрезку, но не меньше `min_width`.
 
     Возврат: `(offset, width, side)` или None, если места нет. `side` — к какому
     концу стены проём прижат ("left"/"right"), из него берётся петля двери.
@@ -281,6 +285,19 @@ def place_opening(
             return None
         fitting, width = [widest], widest[1] - widest[0]
     if anchor == "corner":
+        if prefer_side in ("left", "right"):
+            # Метка side — по ФАКТУ, а не по желанию: ближайший к нужному углу
+            # спан может лежать и в середине стены (камера keepout'ом съела
+            # угол, кадр frame12), и вызывающий должен увидеть это в метке,
+            # иначе его удержание угла принимает середину за угол.
+            if prefer_side == "left":
+                a, b = min(fitting, key=lambda s: s[0] - wall_start)
+                offset = a + width / 2
+            else:
+                a, b = min(fitting, key=lambda s: wall_end - s[1])
+                offset = b - width / 2
+            side = "left" if offset - wall_start <= wall_end - offset else "right"
+            return offset, width, side
         a, b = min(fitting, key=lambda s: min(s[0] - wall_start, wall_end - s[1]))
         if (a - wall_start) <= (wall_end - b):
             return a + width / 2, width, "left"
