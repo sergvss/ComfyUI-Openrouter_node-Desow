@@ -201,6 +201,13 @@ class OpenRouterNode:
             return 1.0  # Return default if conversion fails
 
     @staticmethod
+    def _is_image_model(model_name):
+        """Модель генерирует картинки: в id есть "image" (Nano Banana 2 / Pro: gemini-*-image*)
+        или "nano-banana" (Nano Banana 2.1: google/gemini-nano-banana-2.1 - без "image" в id)."""
+        m = (model_name or "").lower()
+        return "image" in m or "nano-banana" in m
+
+    @staticmethod
     def _detect_aspect_and_size(src_w, src_h, model_name):
         """
         Подбирает ближайшие поддерживаемые aspect_ratio и image_size по размерам исходного изображения.
@@ -223,8 +230,8 @@ class OpenRouterNode:
             ("16:9", 16, 9),
             ("21:9", 21, 9),
         ]
-        # Nano Banana 2 (gemini-3.1-flash-image*) поддерживает экстремальные соотношения
-        if "gemini-3.1-flash-image" in model_name.lower():
+        # Nano Banana 2 (gemini-3.1-flash-image*) и 2.1 (gemini-nano-banana-2.1) поддерживают экстремальные соотношения
+        if "gemini-3.1-flash-image" in model_name.lower() or "nano-banana" in model_name.lower():
             candidates += [
                 ("1:4", 1, 4),
                 ("4:1", 4, 1),
@@ -628,8 +635,8 @@ class OpenRouterNode:
             "seed": clamped_seed
         }
 
-        # Определяем, является ли модель image-генерирующей по наличию "image" в имени
-        is_image_model = "image" in modified_model.lower()
+        # Определяем, является ли модель image-генерирующей (по имени: "image" или "nano-banana")
+        is_image_model = self._is_image_model(modified_model)
 
         if is_image_model:
             # Для image-моделей OpenRouter требует явно указать modalities, иначе картинка не возвращается
