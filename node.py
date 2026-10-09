@@ -33,6 +33,24 @@ def _looks_like_stale_api_key(value) -> bool:
     return probe.startswith("sk-or-") or "OPENROUTER_API_KEY" in probe.upper()
 
 
+# Запасные модели: если основная отвечает ошибкой или лимитом (429 upstream), OpenRouter сам повторяет тот же
+# запрос на следующей модели из списка `models`. Повод: 2026-10-09 Google дважды за день ограничивал
+# Nano Banana 2.1, а прежняя NB2 в те же минуты работала.
+FALLBACK_MODELS = {
+    "google/gemini-nano-banana-2.1": ["google/gemini-3.1-flash-image-preview"],
+}
+
+
+def _fallback_models(model):
+    """Список `models` для OpenRouter (основная + запасные) или None, если запасных нет.
+    Модификаторы (:online/:floor/:nitro) переносятся на запасные модели."""
+    base, sep, suffix = (model or "").partition(":")
+    extra = FALLBACK_MODELS.get(base)
+    if not extra:
+        return None
+    return [model] + [m + (sep + suffix if sep else "") for m in extra]
+
+
 # Define a placeholder type name for PDF data.
 # The actual input connection will accept '*' but we check the structure.
 # Expecting a dictionary: {"filename": str, "bytes": bytes}
@@ -690,7 +708,12 @@ class OpenRouterNode:
             if image_config:
                 data["image_config"] = image_config
 
-        print(f"Payload: model={modified_model}, modalities={data.get('modalities')}, image_config={data.get('image_config')}")
+        # Запасные модели на случай ошибки/лимита основной (OpenRouter перебирает список сам, одним запросом)
+        fallback_list = _fallback_models(modified_model)
+        if fallback_list:
+            data["models"] = fallback_list
+
+        print(f"Payload: model={modified_model}, models={data.get('models')}, modalities={data.get('modalities')}, image_config={data.get('image_config')}")
 
         # Add plugins if a specific PDF engine is selected
         if pdf_engine != "auto":
@@ -919,6 +942,11 @@ class OpenRouterNode:
                 f"Temp: {validated_temp:.1f}, "
                 f"Model: {modified_model}" # Display the actual model used
             )
+            # Какая модель реально ответила (при сработавшей запасной - не основная)
+            served_by = result.get("model") if isinstance(result, dict) else None
+            if served_by and fallback_list and served_by.split(":")[0] != modified_model.split(":")[0]:
+                stats_text += f", Fallback: {served_by}"
+                print(f"[OpenRouter] Основная модель {modified_model} недоступна - ответила запасная {served_by}")
             if pdf_engine != "auto":
                  stats_text += f", PDF Engine: {pdf_engine}"
 
