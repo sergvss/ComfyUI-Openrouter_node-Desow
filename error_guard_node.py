@@ -2,11 +2,11 @@
 OpenRouter отдала в мягком режиме (`fail_soft=True`, префикс `OPENROUTER_ERROR`).
 
 Зачем: ComfyDeploy не передаёт текст исключения ни в API прогона, ни в webhook
-`failed` - там только статус и выходы нод. Поэтому ошибку сначала выводим
-(OpenRouterNode с fail_soft -> showAnything: текст попадает в выходы прогона),
-а уже потом этот сторож роняет прогон - статус остаётся `failed`, кредиты
-возвращаются, а бэк берёт текст из выходов. Без сторожа fail_soft пустил бы
-дальше чёрный кадр, и следующие проходы платили бы за генерацию по нему.
+`failed` - там только статус и выходы нод. Поэтому сторож сначала публикует
+ошибку событием `executed` (текст попадает в выходы прогона), а потом роняет
+прогон - статус остаётся `failed`, кредиты возвращаются, а бэк берёт текст из
+выходов. Без сторожа fail_soft пустил бы дальше чёрный кадр, и следующие
+проходы платили бы за генерацию по нему.
 """
 
 FAIL_PREFIX = "OPENROUTER_ERROR"
@@ -34,19 +34,38 @@ def check_text(text):
     return s if s.startswith(FAIL_PREFIX) else None
 
 
+def publish_error(node_id, err):
+    """Отправить текст ошибки событием `executed` от этой ноды, как будто она вывела текст.
+
+    Плагин ComfyDeploy записывает в выходы прогона каждое `executed` (кроме PreviewImage),
+    а обычные выходные ноды для этого не годятся: ComfyUI исполняет их всегда, и в
+    ленивых ветках они тянули бы платный вызов модели. Вне ComfyUI (тесты) - тихо пропускаем.
+    """
+    try:
+        from server import PromptServer
+        ps = PromptServer.instance
+        ps.send_sync("executed", {"node": str(node_id), "display_node": str(node_id), "output": {"text": [err]},
+                                  "prompt_id": getattr(ps, "last_prompt_id", None)}, getattr(ps, "client_id", None))
+        return True
+    except Exception as exc:  # отсутствие сервера не должно подменять исходную ошибку
+        print("[OpenRouterErrorGuard] не удалось опубликовать ошибку: %s" % exc)
+        return False
+
+
 class OpenRouterErrorGuard:
-    """Пропускает `value` насквозь; если `text` - мягкая ошибка OpenRouter, роняет прогон."""
+    """Пропускает `value` насквозь; если `text` - мягкая ошибка OpenRouter, публикует её
+    в выходы прогона и роняет прогон с тем же текстом."""
 
     @classmethod
     def INPUT_TYPES(cls):
         return {
             "required": {
-                # Текст-выход OpenRouterNode (лучше через showAnything, чтобы ошибка
-                # гарантированно попала в выходы прогона ДО падения)
+                # Текст-выход Output ноды OpenRouterNode с fail_soft=True
                 "text": ("STRING", {"forceInput": True}),
                 # Любое значение, которое идёт дальше по графу (картинка или текст)
                 "value": (ANY_TYPE,),
-            }
+            },
+            "hidden": {"unique_id": "UNIQUE_ID"},
         }
 
     RETURN_TYPES = (ANY_TYPE,)
@@ -54,9 +73,10 @@ class OpenRouterErrorGuard:
     FUNCTION = "guard"
     CATEGORY = "OpenRouter"
 
-    def guard(self, text, value):
+    def guard(self, text, value, unique_id=None):
         err = check_text(text)
         if err:
+            publish_error(unique_id, err)
             raise OpenRouterErrorGuardError(err)
         return (value,)
 
