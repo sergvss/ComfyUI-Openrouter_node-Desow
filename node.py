@@ -51,6 +51,30 @@ def _fallback_models(model):
     return [model] + [m + (sep + suffix if sep else "") for m in extra]
 
 
+# Причины отказа Gemini по содержанию (`native_finish_reason`): повтор с тем же входом даёт тот же отказ
+# (проверено 2026-10-05: seed и температура не помогают), поэтому падаем сразу и пишем причину.
+CONTENT_REFUSAL_REASONS = {
+    "IMAGE_RECITATION": "image resembles a known picture (e.g. stock photo)",
+    "RECITATION": "answer resembles known content",
+    "IMAGE_SAFETY": "image safety filter",
+    "SAFETY": "safety filter",
+    "IMAGE_PROHIBITED_CONTENT": "prohibited image content",
+    "PROHIBITED_CONTENT": "prohibited content",
+    "BLOCKLIST": "blocked terms",
+    "SPII": "sensitive personal data",
+}
+
+
+def _content_refusal(choice):
+    """Текст ошибки, если пустой ответ - отказ модели по содержанию; None, если причина не названа."""
+    native = str(choice.get("native_finish_reason") or "").upper()
+    if native in CONTENT_REFUSAL_REASONS:
+        return "Content refusal (%s): %s, retry will not help" % (native, CONTENT_REFUSAL_REASONS[native])
+    if choice.get("finish_reason") == "content_filter":
+        return "Content refusal (content_filter): provider filter, retry will not help"
+    return None
+
+
 # Define a placeholder type name for PDF data.
 # The actual input connection will accept '*' but we check the structure.
 # Expecting a dictionary: {"filename": str, "bytes": bytes}
@@ -841,6 +865,10 @@ class OpenRouterNode:
             # повторной попытке. Если все попытки пусты — raise (НЕ silent placeholder).
             message = choice["message"]
             if is_image_model and not message.get("images"):
+                # Отказ по содержанию стабилен (тот же вход = тот же отказ) - не повторяем
+                refusal = _content_refusal(choice)
+                if refusal:
+                    raise RuntimeError(refusal)
                 last_error = "image-model returned no images (possibly safety reject or temporary Gemini issue)"
                 if attempt < max_retries:
                     print(f"[OpenRouter] {last_error} — retry {attempt + 1}/{max_retries} after backoff")
