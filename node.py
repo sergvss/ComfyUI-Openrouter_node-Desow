@@ -75,6 +75,22 @@ def _content_refusal(choice):
     return None
 
 
+def _limit_side(image, max_side):
+    """Картинка ComfyUI (BHWC/HWC, 0-1), уменьшенная так, чтобы длинная сторона была не больше max_side (LANCZOS).
+    max_side <= 0 или картинка и так меньше - возвращается без изменений (не увеличиваем)."""
+    if not max_side or not isinstance(image, torch.Tensor) or image.ndim not in (3, 4):
+        return image
+    h, w = (image.shape[1], image.shape[2]) if image.ndim == 4 else (image.shape[0], image.shape[1])
+    if max(h, w) <= max_side:
+        return image
+    scale = max_side / float(max(h, w))
+    nw, nh = max(1, round(w * scale)), max(1, round(h * scale))
+    arr = (image[0] if image.ndim == 4 else image).cpu().numpy()
+    pil = Image.fromarray(np.clip(arr * 255.0, 0, 255).astype(np.uint8)).resize((nw, nh), Image.LANCZOS)
+    out = torch.from_numpy(np.asarray(pil).astype(np.float32) / 255.0)
+    return out.unsqueeze(0) if image.ndim == 4 else out
+
+
 # Define a placeholder type name for PDF data.
 # The actual input connection will accept '*' but we check the structure.
 # Expecting a dictionary: {"filename": str, "bytes": bytes}
@@ -197,6 +213,10 @@ class OpenRouterNode:
                 # насквозь. Виджет добавлен ПОСЛЕ fail_soft (append-only).
                 "gate_text": ("STRING", {"forceInput": True}),
                 "gate_skip_value": ("STRING", {"default": ""}),
+                # Длинная сторона картинок, уходящих в API (0 = как есть). Gemini всё равно ужимает вход у себя,
+                # а большой PNG дольше идёт по сети и обрабатывается: 2900 -> 2048 px = минус ~10 с на вызов
+                # (замер 2026-10-15). Размер ответа «auto» считается по исходному image_1. Append-only.
+                "max_input_side": ("INT", {"default": 0, "min": 0, "max": 8192}),
             }
         }
 
@@ -453,6 +473,11 @@ class OpenRouterNode:
         for _name, _img in (("image_1", image_1), ("image_2", image_2), ("image_3", image_3), ("image_4", image_4), ("image_5", image_5)):
             if _img is not None:
                 kwargs[_name] = _img
+        # Предел стороны картинок для API (виджет max_input_side); забираем из kwargs, чтобы не мешал циклам по ним
+        try:
+            max_input_side = int(kwargs.pop("max_input_side", 0) or 0)
+        except (TypeError, ValueError):
+            max_input_side = 0
         """
         Sends a completion request to the OpenRouter chat completion endpoint.
         Handles text, optional image, and optional PDF inputs.
@@ -569,7 +594,7 @@ class OpenRouterNode:
                             "text": label
                         })
                         user_echo_parts.append(label)
-                    img_str = self.image_to_base64(kwargs[image_key])
+                    img_str = self.image_to_base64(_limit_side(kwargs[image_key], max_input_side))
                     user_content_blocks.append({
                         "type": "image_url",
                         "image_url": {

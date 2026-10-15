@@ -26,6 +26,8 @@ EXPECTED_WIDGETS = [
     # append-only: гейт пропуска (скан, «комната уже пустая») - виджет строго
     # ПОСЛЕ fail_soft; gate_text - forceInput-сокет, в виджеты не входит.
     "gate_skip_value",
+    # append-only: предел стороны картинок для API (2026-10-15)
+    "max_input_side",
 ]
 WIDGET_TYPES = {"STRING", "INT", "FLOAT", "BOOLEAN"}
 
