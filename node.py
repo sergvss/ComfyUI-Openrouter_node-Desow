@@ -217,6 +217,9 @@ class OpenRouterNode:
                 # а большой PNG дольше идёт по сети и обрабатывается: 2900 -> 2048 px = минус ~10 с на вызов
                 # (замер 2026-10-15). Размер ответа «auto» считается по исходному image_1. Append-only.
                 "max_input_side": ("INT", {"default": 0, "min": 0, "max": 8192}),
+                # Строгий JSON в ответе текстовой модели (response_format json_object): планировщик Furnish 2.5 иначе
+                # изредка отдаёт неэкранированные кавычки в строках (2026-10-16). Для image-моделей не отправляется. Append-only.
+                "json_mode": ("BOOLEAN", {"default": False}),
             }
         }
 
@@ -478,6 +481,8 @@ class OpenRouterNode:
             max_input_side = int(kwargs.pop("max_input_side", 0) or 0)
         except (TypeError, ValueError):
             max_input_side = 0
+        # Строгий JSON (виджет json_mode); забираем из kwargs по той же причине
+        json_mode = bool(kwargs.pop("json_mode", False))
         """
         Sends a completion request to the OpenRouter chat completion endpoint.
         Handles text, optional image, and optional PDF inputs.
@@ -756,6 +761,9 @@ class OpenRouterNode:
             # Отправляем image_config только если там есть хотя бы одно поле - иначе провайдер использует свои дефолты
             if image_config:
                 data["image_config"] = image_config
+
+        if json_mode and not is_image_model:
+            data["response_format"] = {"type": "json_object"}
 
         # Запасные модели на случай ошибки/лимита основной (OpenRouter перебирает список сам, одним запросом)
         fallback_list = _fallback_models(modified_model)

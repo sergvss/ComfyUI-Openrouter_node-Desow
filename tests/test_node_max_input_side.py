@@ -51,7 +51,8 @@ def sent_image_size(body):
 
 def test_widget_is_appended_last_and_off_by_default():
     spec = node_mod.OpenRouterNode.INPUT_TYPES()["optional"]
-    assert list(spec)[-1] == "max_input_side"
+    # за ним append-only идёт json_mode (2026-10-16)
+    assert list(spec)[-2:] == ["max_input_side", "json_mode"]
     assert spec["max_input_side"][1]["default"] == 0
 
 

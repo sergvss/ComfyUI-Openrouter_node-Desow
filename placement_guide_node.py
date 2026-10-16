@@ -23,7 +23,11 @@ class DesowPlacementGuide:
             "required": {
                 "scene": ("IMAGE",),
                 "plan": ("STRING", {"forceInput": True}),
-            }
+            },
+            "optional": {
+                # numbered - Moodboard (схема картинкой + план с номерами); positions - Furnish 2.5 (без схемы, место в кадре текстом)
+                "text_style": (["numbered", "positions"], {"default": "numbered"}),
+            },
         }
 
     RETURN_TYPES = ("IMAGE", "STRING")
@@ -32,7 +36,7 @@ class DesowPlacementGuide:
     FUNCTION = "build"
     CATEGORY = "Desow/Moodboard"
 
-    def build(self, scene, plan):
+    def build(self, scene, plan, text_style="numbered"):
         try:
             p = parse_plan(plan)
         except ValueError as e:
@@ -41,7 +45,7 @@ class DesowPlacementGuide:
         arr = (scene[0].cpu().numpy() * 255).clip(0, 255).astype(np.uint8)
         guide = draw_guide(Image.fromarray(arr[:, :, :3]), p)
         out = torch.from_numpy(np.asarray(guide).astype(np.float32) / 255.0)[None, ...]
-        return (out, plan_text(p))
+        return (out, plan_text(p, positions=(text_style == "positions")))
 
 
 NODE_CLASS_MAPPINGS = {

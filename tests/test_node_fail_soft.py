@@ -28,6 +28,8 @@ EXPECTED_WIDGETS = [
     "gate_skip_value",
     # append-only: предел стороны картинок для API (2026-10-15)
     "max_input_side",
+    # append-only: строгий JSON в ответе текстовой модели (2026-10-16)
+    "json_mode",
 ]
 WIDGET_TYPES = {"STRING", "INT", "FLOAT", "BOOLEAN"}
 

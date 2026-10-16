@@ -40,6 +40,35 @@ def test_plan_text_lines():
     assert t[2] == "2. Lamp"
 
 
+def test_plan_text_positions_mode():
+    # Furnish 2.5: без номеров, место в кадре текстом в процентах
+    t = plan_text(PLAN, positions=True).split("\n")
+    assert t[1] == ("- Sofa, olive velvet: against the back wall ; camera ; 220 x 90 x 85 cm ; in the photo: "
+                    "from 30% to 70% of the width (left to right), from 40% to 60% of the height (top to bottom)")
+    assert t[2].startswith("- Lamp: in the photo: from 5% to 20% of the width")
+    assert not any(line[:1].isdigit() for line in t)
+
+
+def test_plan_text_positions_lists_openings():
+    plan = dict(PLAN, openings=[{"type": "window", "box_2d": [200, 400, 600, 600]}, {"type": "glass door", "box_2d": [300, 100, 900, 250]}])
+    t = plan_text(plan, positions=True).split("\n")
+    assert t[1].startswith("FIXED OPENINGS - the room has exactly 1 window(s) and 1 door(s), no others")
+    assert t[2] == "- opening 1: window ; in the photo: from 40% to 60% of the width (left to right), from 20% to 60% of the height (top to bottom)"
+    assert t[3].startswith("- opening 2: glass door ; in the photo: from 10% to 25%")
+    # в режиме Moodboard проёмы не выводятся
+    assert "FIXED OPENINGS" not in plan_text(plan)
+
+
+def test_plan_text_positions_lists_walls_before_openings():
+    plan = dict(PLAN, walls=[{"what": "back wall", "box_2d": [100, 330, 700, 650]}, {"what": "bad"}],
+                openings=[{"type": "window", "box_2d": [200, 400, 600, 600]}])
+    t = plan_text(plan, positions=True).split("\n")
+    assert t[1].startswith("FIXED WALLS")
+    assert t[2] == "- back wall ; in the photo: from 33% to 65% of the width (left to right), from 10% to 70% of the height (top to bottom)"
+    assert t[3].startswith("FIXED OPENINGS")       # стена без рамки пропущена
+    assert "FIXED WALLS" not in plan_text(plan)    # Moodboard - без опор
+
+
 # ── схема ────────────────────────────────────────────────────────────
 def test_draw_guide_keeps_size_and_draws_box_edges():
     scene = Image.new("RGB", (1000, 800), (0, 0, 0))
